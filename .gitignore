@@ -1,0 +1,6 @@
+*.log
+.sent_log.csv
+.env
+node_modules/
+__pycache__/
+*.pyc

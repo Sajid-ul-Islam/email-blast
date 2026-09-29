@@ -1,0 +1,16 @@
+email,name
+owner@example.com,Example Owner
+alice.example@email.com,Alice Example
+bob.smith@sample.org,Bob Smith
+
+# ---- Instructions ----
+# This is a SAMPLE file. Delete these 3 rows and replace them with your own recipients.
+#
+# REQUIRED: at least the "email" column. Every row must have a valid email in column A.
+# OPTIONAL: the "name" column is used for personalization (e.g. "Hello, {{name}}").
+#
+# You can add more columns (phone, city, etc.) — the app reads any column that looks
+# like an email address, so the email can be in any column, not just column A.
+#
+# Save as UTF-8 CSV. One recipient per row. Header row required.
+# 

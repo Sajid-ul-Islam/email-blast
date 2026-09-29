@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Email Blast — Upload &amp; Send</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>📧 Email Blast</h1>
+      <p class="subtitle">Upload a CSV of recipients, write or upload the content, then send.</p>
+    </header>
+
+    <section class="card upload-card">
+      <h2>1. Upload your recipient list</h2>
+      <p class="hint">CSV with at least one column containing email addresses. 
+         See the <a href="/sample.csv">sample CSV</a> for the recommended format.</p>
+
+      <form action="/upload" method="post" enctype="multipart/form-data" class="upload-form">
+        <div class="file-zone" id="fileZone">
+          <input type="file" name="file" id="fileInput" accept=".csv" required>
+          <label for="fileInput" class="file-label" id="fileLabel">
+            <span class="file-icon">📄</span>
+            <span class="file-text">
+              <strong class="file-click">Click to choose a CSV file</strong>
+              <span class="file-or">or drag it here</span>
+            </span>
+          </label>
+          <div class="file-names" id="fileNames"></div>
+        </div>
+        <button type="submit" class="btn btn-primary" id="uploadBtn" disabled>Upload &amp; Preview</button>
+      </form>
+
+      <div class="requirements">
+        <h3>CSV format</h3>
+        <ul>
+          <li><strong>Required:</strong> at least one column with email addresses (anything containing <code>@</code>).</li>
+          <li><strong>Optional:</strong> a <code>name</code> column for personalization, plus any extra columns you like (city, phone, etc.).</li>
+          <li>One recipient per row. The app extracts every valid email it finds.</li>
+          <li>Duplicate emails are deduplicated automatically.</li>
+        </ul>
+      </div>
+    </section>
+
+    {% if uploaded %}
+    <section class="card preview-card">
+      <h2>2. Preview</h2>
+      <div class="preview-meta">
+        <span><strong>File:</strong> {{ filename }}</span>
+        <span><strong>Rows found:</strong> {{ row_count }}</span>
+        <span><strong>Valid emails:</strong> {{ email_count }}</span>
+        <span><strong>Duplicates removed:</strong> {{ duplicates }}</span>
+      </div>
+
+      {% if email_list %}
+      <div class="email-table-wrap">
+        <table class="email-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Email</th>
+              {% if preview_names %}
+              <th>Name</th>
+              {% endif %}
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in email_list %}
+            <tr>
+              <td>{{ loop.index }}</td>
+              <td class="email-cell">{{ row.email }}</td>
+              {% if preview_names and row.name %}
+              <td class="name-cell">{{ row.name }}</td>
+              {% endif %}
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <p class="hint">Showing first {{ preview_limit }} of {{ email_count }} emails. 
+         <a href="/preview/{{ file_id }}">View all</a></p>
+      {% else %}
+      <p class="error">No valid email addresses found in this file. Check the format and try again.</p>
+      {% endif %}
+
+      <div class="preview-actions">
+        <a href="/" class="btn btn-secondary">← Upload another</a>
+        <a href="/uploads/{{ filename }}" class="btn btn-secondary">Download this file</a>
+      </div>
+    </section>
+
+    <section class="card content-card">
+      <h2>3. Content</h2>
+      <p class="hint">Type the subject and body below, or upload a content file
+         (<code>.txt</code>: first line = subject, rest = body;
+         <code>.json</code>: <code>{"subject": "...", "body": "..."}</code>;
+         <code>.html</code>: uses &lt;title&gt; as subject, full HTML as body).</p>
+
+      <form id="contentForm" class="content-form">
+        <input type="hidden" name="file_id" value="{{ file_id }}">
+        <input type="hidden" name="use_content_file" id="useContentFile" value="0">
+        <input type="hidden" name="content_file_id" id="contentFileId" value="">
+
+        <div class="field">
+          <label for="subject">Subject</label>
+          <input type="text" id="subject" name="subject" class="input" placeholder="e.g. Hello from DEEN">
+        </div>
+
+        <div class="field">
+          <label for="body">Body</label>
+          <textarea id="body" name="body" class="textarea" rows="8" placeholder="Write your message here. Use {{name}} to insert the recipient's name, {{city}}, {{phone}}, etc. for other CSV columns."></textarea>
+        </div>
+
+        <div class="field">
+          <label>Or upload a content file</label>
+          <div class="file-zone small" id="contentFileZone">
+            <input type="file" name="contentFile" id="contentFileInput" accept=".txt,.json,.html">
+            <label for="contentFileInput" class="file-label">
+              <span class="file-icon">📄</span>
+              <span class="file-text">
+                <strong class="file-click">Choose .txt, .json, or .html content file</strong>
+                <span class="file-or">or drag it here</span>
+              </span>
+            </label>
+            <div class="file-names" id="contentFileNames"></div>
+          </div>
+          <p class="hint">Uploading a content file fills the subject and body above. You can then edit them before sending.</p>
+        </div>
+
+        <div class="content-actions">
+          <button type="button" class="btn btn-secondary" id="applyContentBtn" disabled>Apply uploaded content</button>
+          <a href="/" class="btn btn-secondary">← Back</a>
+          <button type="button" class="btn btn-primary" id="sendBtn" disabled>Send now →</button>
+        </div>
+
+        <div class="send-hint" id="sendHint">
+          Fill in the subject and body above, then click <strong>Send now →</strong> to start the campaign.
+          A progress page will open showing live results.
+        </div>
+      </form>
+    </section>
+    {% endif %}
+
+    {% if all_files %}
+    <section class="card files-card">
+      <h2>Previously uploaded</h2>
+      <table class="files-table">
+        <thead>
+          <tr>
+            <th>File</th>
+            <th>Emails</th>
+            <th>Uploaded</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for f in all_files %}
+          <tr>
+            <td>{{ f.name }}</td>
+            <td>{{ f.email_count }}</td>
+            <td>{{ f.uploaded }}</td>
+            <td>
+              <a href="/uploads/{{ f.name }}" class="btn btn-small">Download</a>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <p class="hint">Files are stored in the <code>uploads/</code> folder. Delete them there to remove.</p>
+    </section>
+    {% endif %}
+  </div>
+
+  <script>
+    (function () {
+      // ---- Upload file input UI ----
+      const fileInput = document.getElementById('fileInput');
+      const fileLabel = document.getElementById('fileLabel');
+      const fileNames = document.getElementById('fileNames');
+      const uploadBtn = document.getElementById('uploadBtn');
+
+      function updateUploadUI() {
+        const files = fileInput.files;
+        uploadBtn.disabled = files.length === 0;
+        fileNames.innerHTML = '';
+        for (const f of files) {
+          const div = document.createElement('div');
+          div.className = 'file-chip';
+          div.textContent = f.name + ' (' + formatBytes(f.size) + ')';
+          fileNames.appendChild(div);
+        }
+        if (files.length > 0) {
+          fileLabel.querySelector('.file-text').innerHTML =
+            '<span class="file-remove" id="fileRemove">✕ Remove</span>';
+          document.getElementById('fileRemove').onclick = () => {
+            fileInput.value = '';
+            updateUploadUI();
+          };
+        } else {
+          fileLabel.querySelector('.file-text').innerHTML =
+            '<strong class="file-click">Click to choose a CSV file</strong>' +
+            '<span class="file-or">or drag it here</span>';
+        }
+      }
+
+      function formatBytes(bytes) {
+        if (bytes < 1024) return bytes + ' B';
+        if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+        return (bytes / 1048576).toFixed(1) + ' MB';
+      }
+
+      fileInput.addEventListener('change', updateUploadUI);
+      updateUploadUI();
+
+      const zone = document.getElementById('fileZone');
+      ['dragenter', 'dragover'].forEach(ev =>
+        zone.addEventListener(ev, e => { e.preventDefault(); zone.classList.add('drag-over'); }));
+      ['dragleave', 'drop'].forEach(ev =>
+        zone.addEventListener(ev, e => { e.preventDefault(); zone.classList.remove('drag-over'); }));
+      zone.addEventListener('drop', e => {
+        if (e.dataTransfer.files.length) {
+          fileInput.files = e.dataTransfer.files;
+          updateUploadUI();
+        }
+      });
+
+      // ---- Content file input UI ----
+      const contentFileInput = document.getElementById('contentFileInput');
+      const contentFileLabel = document.querySelector('#contentFileZone .file-label');
+      const contentFileNames = document.getElementById('contentFileNames');
+      const applyContentBtn = document.getElementById('applyContentBtn');
+      const contentFileIdInput = document.getElementById('contentFileId');
+      const useContentFileInput = document.getElementById('useContentFile');
+
+      function updateContentFileUI() {
+        const files = contentFileInput.files;
+        contentFileNames.innerHTML = '';
+        if (files.length > 0) {
+          for (const f of files) {
+            const div = document.createElement('div');
+            div.className = 'file-chip';
+            div.textContent = f.name + ' (' + formatBytes(f.size) + ')';
+            contentFileNames.appendChild(div);
+          }
+          contentFileLabel.querySelector('.file-text').innerHTML =
+            '<span class="file-remove" id="contentFileRemove">✕ Remove</span>';
+          document.getElementById('contentFileRemove').onclick = () => {
+            contentFileInput.value = '';
+            updateContentFileUI();
+          };
+          applyContentBtn.disabled = false;
+        } else {
+          contentFileLabel.querySelector('.file-text').innerHTML =
+            '<strong class="file-click">Choose .txt, .json, or .html content file</strong>' +
+            '<span class="file-or">or drag it here</span>';
+          applyContentBtn.disabled = true;
+          contentFileIdInput.value = '';
+        }
+      }
+
+      contentFileInput.addEventListener('change', updateContentFileUI);
+      updateContentFileUI();
+
+      const contentZone = document.getElementById('contentFileZone');
+      ['dragenter', 'dragover'].forEach(ev =>
+        contentZone.addEventListener(ev, e => { e.preventDefault(); contentZone.classList.add('drag-over'); }));
+      ['dragleave', 'drop'].forEach(ev =>
+        contentZone.addEventListener(ev, e => { e.preventDefault(); contentZone.classList.remove('drag-over'); }));
+      contentZone.addEventListener('drop', e => {
+        if (e.dataTransfer.files.length) {
+          contentFileInput.files = e.dataTransfer.files;
+          updateContentFileUI();
+        }
+      });
+
+      // ---- Apply uploaded content ----
+      applyContentBtn.addEventListener('click', () => {
+        const file = contentFileInput.files[0];
+        if (!file) return;
+        const formData = new FormData();
+        formData.append('file', file);
+        fetch('/content', { method: 'POST', body: formData })
+          .then(r => r.json())
+          .then(data => {
+            if (!data.ok) {
+              alert('Error reading content file: ' + (data.error || 'unknown'));
+              return;
+            }
+            document.getElementById('subject').value = data.subject;
+            document.getElementById('body').value = data.body;
+            contentFileIdInput.value = data.file_id;
+            useContentFileInput.value = '1';
+            applyContentBtn.disabled = true;
+            contentFileInput.value = '';
+            updateContentFileUI();
+            document.getElementById('sendHint').textContent =
+              'Content loaded from "' + data.source + '". Edit if needed, then click Send now →.';
+          })
+          .catch(err => {
+            alert('Failed to read content file: ' + err.message);
+          });
+      });
+
+      // ---- Send button ----
+      const sendBtn = document.getElementById('sendBtn');
+      sendBtn.addEventListener('click', () => {
+        const subject = document.getElementById('subject').value.trim();
+        const body = document.getElementById('body').value.trim();
+        if (!subject) {
+          document.getElementById('subject').focus();
+          document.getElementById('subject').classList.add('input-error');
+          setTimeout(() => document.getElementById('subject').classList.remove('input-error'), 2000);
+          return;
+        }
+        if (!body) {
+          document.getElementById('body').focus();
+          document.getElementById('body').classList.add('input-error');
+          setTimeout(() => document.getElementById('body').classList.remove('input-error'), 2000);
+          return;
+        }
+
+        sendBtn.disabled = true;
+        sendBtn.textContent = 'Sending…';
+
+        const form = document.getElementById('contentForm');
+        const formData = new FormData(form);
+        fetch('/send', { method: 'POST', body: formData })
+          .then(r => r.json())
+          .then(data => {
+            if (!data.ok) {
+              alert('Send error: ' + (data.error || 'unknown'));
+              sendBtn.disabled = false;
+              sendBtn.textContent = 'Send now →';
+              return;
+            }
+            window.location.href = '/job/' + data.job_id;
+          })
+          .catch(err => {
+            alert('Send request failed: ' + err.message);
+            sendBtn.disabled = false;
+            sendBtn.textContent = 'Send now →';
+          });
+      });
+
+      // Live validation hint — only runs when the content section is rendered
+      const sendBtnEl = document.getElementById('sendBtn');
+      if (sendBtnEl) {
+        ['subject', 'body'].forEach(id => {
+          const el = document.getElementById(id);
+          if (!el) return;
+          el.addEventListener('input', () => {
+            const s = document.getElementById('subject').value.trim();
+            const b = document.getElementById('body').value.trim();
+            sendBtnEl.disabled = !(s && b);
+            const hint = document.getElementById('sendHint');
+            if (hint) {
+              hint.textContent = (s && b)
+                ? 'Ready to send to ' + {{ email_count if email_count else 0 }} + ' recipients. Click Send now →.'
+                : 'Fill in the subject and body above, then click Send now →.';
+            }
+          });
+        });
+        // Initial hint state
+        if ({{ email_count|default(0) }} > 0) {
+          const hint = document.getElementById('sendHint');
+          if (hint) hint.textContent = 'Fill in the subject and body above, then click Send now →.';
+        }
+      }
+    })();
+  </script>
+</body>
+</html>

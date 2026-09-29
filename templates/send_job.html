@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sending — Email Blast</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <style>
+    .progress-bar {
+      height: 18px;
+      background: #e2e5ea;
+      border-radius: 9px;
+      overflow: hidden;
+      margin: 10px 0 16px;
+    }
+    .progress-fill {
+      height: 100%;
+      background: #2563eb;
+      transition: width 0.4s ease;
+      width: 0%;
+    }
+    .progress-fill.done { background: #16a34a; }
+    .progress-fill.failed { background: #dc2626; }
+    .result-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 10px;
+      border-radius: 6px;
+      font-size: 13.5px;
+      font-family: "SF Mono", Consolas, monospace;
+    }
+    .result-row.sent { background: #f0fdf4; color: #166534; }
+    .result-row.failed { background: #fef2f2; color: #991b1b; }
+    .result-list { max-height: 320px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .badge-sent { background: #dcfce7; color: #166534; }
+    .badge-failed { background: #fee2e2; color: #991b1b; }
+    .badge-running { background: #dbeafe; color: #1e40af; }
+    .badge-done { background: #dcfce7; color: #166534; }
+    .badge-error { background: #fee2e2; color: #991b1b; }
+    .badge-starting { background: #fef3c7; color: #92400e; }
+    .badge-cancelled { background: #f3f4f6; color: #6b7280; }
+    .error-box {
+      background: #fef2f2;
+      border: 1px solid #fecaca;
+      color: #991b1b;
+      padding: 12px 16px;
+      border-radius: 8px;
+      margin: 12px 0;
+      font-size: 13.5px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>📧 Email Blast — Sending</h1>
+      <p class="subtitle">Job <strong>{{ job_id }}</strong> · {{ list_file }}</p>
+    </header>
+
+    <section class="card progress-card">
+      <h2>Progress</h2>
+      <div class="preview-meta">
+        <span><strong>Subject:</strong> {{ subject }}</span>
+        {% if body_preview %}
+        <span><strong>Body preview:</strong> <span class="muted">{{ body_preview }}</span></span>
+        {% endif %}
+        {% if started_at %}
+        <span><strong>Started:</strong> {{ started_at }}</span>
+        {% endif %}
+        {% if finished_at %}
+        <span><strong>Finished:</strong> {{ finished_at }}</span>
+        {% endif %}
+      </div>
+
+      <div class="progress-stats">
+        <div class="stat">
+          <div class="stat-value" id="statTotal">{{ total }}</div>
+          <div class="stat-label">Total</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value sent" id="statSent">{{ sent }}</div>
+          <div class="stat-label">Sent</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value failed" id="statFailed">{{ failed }}</div>
+          <div class="stat-label">Failed</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value" id="statPending">{{ total - sent - failed }}</div>
+          <div class="stat-label">Pending</div>
+        </div>
+      </div>
+
+      <div class="progress-bar">
+        <div class="progress-fill {% if status == 'done' %}done{% elif status == 'failed' %}failed{% endif %}"
+             id="progressFill" style="width: {{ ((sent + failed) / total * 100) if total > 0 else 0 }}%;"></div>
+      </div>
+
+      <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+        <span class="badge badge-{{ status }}">{{ status }}</span>
+        <span class="hint" id="progressHint">
+          {% if status == 'running' %}Sending in progress — results appear below as they complete.{% endif %}
+          {% if status == 'done' %}All done. See results below.{% endif %}
+          {% if status == 'error' %}Something went wrong. See the error box below.{% endif %}
+          {% if status == 'cancelled' %}Job was cancelled.{% endif %}
+          {% if status == 'starting' %}Starting up…{% endif %}
+        </span>
+      </div>
+
+      {% if status in ('running', 'done', 'error', 'cancelled') %}
+      <div class="progress-actions">
+        {% if status == 'running' %}
+        <form action="/job/{{ job_id }}/cancel" method="post" style="display:inline;">
+          <button type="submit" class="btn btn-secondary">Cancel</button>
+        </form>
+        {% endif %}
+        <a href="/" class="btn btn-secondary">← Back to upload</a>
+        <a href="/job/{{ job_id }}" class="btn btn-secondary">Refresh</a>
+        <button type="button" class="btn btn-secondary" id="autoRefreshBtn">Auto-refresh: ON</button>
+      </div>
+      {% endif %}
+    </section>
+
+    {% if status == 'error' and error %}
+    <section class="card">
+      <h2>Error</h2>
+      <div class="error-box">{{ error }}</div>
+      <p class="hint">Check that the Gmail App Password in <code>.env</code> is correct, and that the email list file still exists.</p>
+      <a href="/" class="btn btn-primary">← Back to upload</a>
+    </section>
+    {% endif %}
+
+    {% if status in ('running', 'done') and results %}
+    <section class="card results-card">
+      <h2>Results <span class="hint">(last {{ results|length }} shown)</span></h2>
+      <div class="result-list" id="resultList">
+        {% for r in results %}
+        <div class="result-row {{ r.status }}">
+          <span>{{ loop.index }}. {{ r.email }}</span>
+          <span class="badge badge-{{ r.status }}">{{ r.status }}</span>
+        </div>
+        {% endfor %}
+      </div>
+    </section>
+    {% endif %}
+
+    {% if status == 'done' and sent == 0 and failed == 0 %}
+    <section class="card">
+      <p class="hint">No results recorded. The job may have been interrupted before sending started.</p>
+    </section>
+    {% endif %}
+  </div>
+
+  <script>
+    (function () {
+      const JOB_ID = '{{ job_id }}';
+      const progressFill = document.getElementById('progressFill');
+      const progressHint = document.getElementById('progressHint');
+      const autoBtn = document.getElementById('autoRefreshBtn');
+      const statSent = document.getElementById('statSent');
+      const statFailed = document.getElementById('statFailed');
+      const statPending = document.getElementById('statPending');
+      const resultList = document.getElementById('resultList');
+      let autoRefresh = '{{ status }}' === 'running' || '{{ status }}' === 'starting';
+      let timer = null;
+      let knownResultCount = {{ results|length }};
+
+      function applyStatus(data) {
+        const sent = data.sent || 0;
+        const failed = data.failed || 0;
+        const total = data.total || 0;
+        const pending = Math.max(0, total - sent - failed);
+        const pct = total > 0 ? ((sent + failed) / total * 100) : 0;
+
+        if (progressFill) {
+          progressFill.style.width = pct + '%';
+          progressFill.className = 'progress-fill ' +
+            (data.status === 'done' || data.status === 'cancelled' ? 'done' :
+             data.status === 'error' ? 'failed' : '');
+        }
+        if (statSent)    statSent.textContent    = sent;
+        if (statFailed)  statFailed.textContent  = failed;
+        if (statPending) statPending.textContent  = pending;
+
+        const badge = document.querySelector('.badge');
+        if (badge) {
+          badge.className = 'badge badge-' + (data.status || '');
+          badge.textContent = data.status || '';
+        }
+
+        if (progressHint) {
+          const s = data.status;
+          if (s === 'running') {
+            progressHint.textContent = 'Sending in progress — ' + sent + ' sent, ' + failed + ' failed, ' + pending + ' pending.';
+          } else if (s === 'done') {
+            progressHint.textContent = 'All done. ' + sent + ' sent, ' + failed + ' failed.';
+          } else if (s === 'error') {
+            progressHint.textContent = 'Error: ' + (data.error || 'unknown');
+          } else if (s === 'cancelled') {
+            progressHint.textContent = 'Job was cancelled. ' + sent + ' sent before stopping.';
+          }
+        }
+
+        // Append any new result rows to the list (avoids full page reload)
+        if (resultList && data.results && data.results.length > knownResultCount) {
+          const newRows = data.results.slice(knownResultCount);
+          newRows.forEach(r => {
+            const div = document.createElement('div');
+            div.className = 'result-row ' + (r.status || '');
+            div.innerHTML =
+              '<span>' + (resultList.children.length + 1) + '. ' +
+              escapeHtml(r.email) + '</span>' +
+              '<span class="badge badge-' + r.status + '">' + r.status + '</span>';
+            resultList.appendChild(div);
+          });
+          knownResultCount = data.results.length;
+        }
+
+        // Stop polling when the job is terminal
+        if (data.status !== 'running' && data.status !== 'starting') {
+          stopAutoRefresh();
+        }
+      }
+
+      function escapeHtml(str) {
+        return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      }
+
+      function stopAutoRefresh() {
+        autoRefresh = false;
+        if (timer) { clearInterval(timer); timer = null; }
+        if (autoBtn) autoBtn.textContent = 'Auto-refresh: OFF';
+      }
+
+      function refresh() {
+        fetch('/job/' + JOB_ID + '/status')
+          .then(r => r.json())
+          .then(data => {
+            if (!data.ok) {
+              progressHint.textContent = 'Job not found. It may have been cleaned up.';
+              stopAutoRefresh();
+              return;
+            }
+            applyStatus(data);
+          })
+          .catch(() => {});
+      }
+
+      if (autoBtn) {
+        autoBtn.addEventListener('click', () => {
+          autoRefresh = !autoRefresh;
+          autoBtn.textContent = 'Auto-refresh: ' + (autoRefresh ? 'ON' : 'OFF');
+          if (autoRefresh) {
+            refresh();
+            timer = setInterval(refresh, 3000);
+          } else {
+            if (timer) { clearInterval(timer); timer = null; }
+          }
+        });
+      }
+
+      // Start auto-refresh if job is still running
+      if (autoRefresh) {
+        refresh();
+        timer = setInterval(refresh, 3000);
+      }
+
+      // Pause polling when tab is hidden; resume when visible again
+      document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+          if (timer) { clearInterval(timer); timer = null; }
+        } else if (autoRefresh) {
+          refresh();
+          timer = setInterval(refresh, 3000);
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

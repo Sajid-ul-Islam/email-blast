@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Preview — Email Blast</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>📧 Email Blast — Full Preview</h1>
+      <p class="subtitle">All {{ email_count }} emails from <strong>{{ filename }}</strong></p>
+    </header>
+
+    <section class="card preview-card">
+      <div class="preview-meta">
+        <span><strong>File:</strong> {{ filename }}</span>
+        <span><strong>Total emails:</strong> {{ email_count }}</span>
+      </div>
+
+      <div class="email-table-wrap">
+        <table class="email-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Email</th>
+              {% if preview_names %}
+              <th>Name</th>
+              {% endif %}
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in email_list %}
+            <tr>
+              <td>{{ loop.index }}</td>
+              <td class="email-cell">{{ row.email }}</td>
+              {% if preview_names and row.name %}
+              <td class="name-cell">{{ row.name }}</td>
+              {% endif %}
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="preview-actions">
+        <a href="/" class="btn btn-primary">← Back to upload</a>
+        <a href="/uploads/{{ filename }}" class="btn btn-secondary">Download this file</a>
+      </div>
+    </section>
+  </div>
+</body>
+</html>

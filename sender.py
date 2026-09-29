@@ -1,4 +1,4 @@
-﻿"""
+"""
 sender.py -- shared email-sending engine for email-blast.
 
 What's new vs. the original:
@@ -111,6 +111,47 @@ def parse_recipients(filepath: Path) -> list[dict[str, Any]]:
         extra = {k: v for k, v in row.items() if k and k.strip().lower() not in name_keys}
         out.append({"email": email, "name": name, "extra": extra})
     return out
+
+
+def parse_content_upload(filepath: Path | str) -> dict[str, Any]:
+    """Parse a .txt, .json, or .html content file into subject, plain body, and html body."""
+    path = Path(filepath)
+    ext = path.suffix.lower()
+    text = path.read_text(encoding="utf-8", errors="replace")
+
+    if ext == ".html":
+        title_match = re.search(r"<title[^>]*>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
+        subject = title_match.group(1).strip() if title_match else path.stem
+        # Generate readable plain text version
+        body = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL | re.IGNORECASE)
+        body = re.sub(r"<script[^>]*>.*?</script>", "", body, flags=re.DOTALL | re.IGNORECASE)
+        body = re.sub(r"<[^>]+>", " ", body)
+        body = "\n".join(line.strip() for line in body.splitlines() if line.strip())
+        return {
+            "subject": subject,
+            "body": body,
+            "html_body": text,
+            "source": path.name,
+        }
+    elif ext == ".json":
+        import json
+        data = json.loads(text)
+        return {
+            "subject": data.get("subject", path.stem),
+            "body": data.get("body", ""),
+            "html_body": data.get("html_body"),
+            "source": path.name,
+        }
+    else:  # default or .txt
+        lines = text.splitlines()
+        subject = lines[0].strip() if lines else path.stem
+        body = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
+        return {
+            "subject": subject,
+            "body": body,
+            "html_body": None,
+            "source": path.name,
+        }
 
 
 def _read_csv_rows(filepath: Path) -> list[dict[str, str]]:

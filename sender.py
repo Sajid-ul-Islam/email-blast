@@ -667,7 +667,7 @@ def send_campaign(
             unsub = entry.get("unsub", "")
             if not limiter.can_send():
                 result = SendResult(recipient["email"], "skipped",
-                                    f"Daily cap reached before retry.")
+                                    "Daily cap reached before retry.")
                 results.append(result)
                 if on_result:
                     on_result(result)

@@ -1,5 +1,8 @@
 *.log
 .sent_log.csv
+sent_log.csv
+test_sent_log.csv
+uploads/
 .env
 node_modules/
 __pycache__/

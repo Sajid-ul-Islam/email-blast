@@ -9,6 +9,13 @@
 <body>
   <div class="container">
     <header>
+      {% if auth_enabled %}
+      <div class="header-auth">
+        <form method="post" action="/logout">
+          <button type="submit" class="btn btn-small btn-secondary">Log out</button>
+        </form>
+      </div>
+      {% endif %}
       <h1>📧 Email Blast</h1>
       <p class="subtitle">Upload a CSV of recipients, write or upload the content, then send.</p>
     </header>

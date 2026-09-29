@@ -1,4 +1,0 @@
-timestamp,email,status,error,error_category
-2026-09-29T09:49:02.900584+00:00,user1@example.com,sent,,unknown
-2026-09-29T09:49:07.618951+00:00,user2@example.com,sent,,unknown
-2026-09-29T09:49:12.238283+00:00,testuser@example.com,sent,,unknown

@@ -1,13 +1,13 @@
 """app.py -- Email Blast Flask web application."""
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
 import threading
 import uuid
-from datetime import datetime, timezone
-from functools import wraps
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +40,7 @@ APP_PASSWORD = os.getenv("APP_PASSWORD", "")
 AUTH_ENABLED = bool(APP_PASSWORD)
 _secret = os.getenv("SECRET_KEY", "").strip()
 app.secret_key = _secret if _secret else os.urandom(32)
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=12)
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOADS_DIR = BASE_DIR / "uploads"
@@ -63,6 +64,64 @@ ALLOWED_ATTACH_EXTS = {
 
 _cancel_events: dict[str, threading.Event] = {}
 _cancel_events_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Session auth -- enabled when APP_PASSWORD is set (see .env.example)
+# ---------------------------------------------------------------------------
+
+# Endpoints called via fetch() from the UI; they get a JSON 401 instead of a
+# login redirect so the client can surface a clean error.
+_JSON_ENDPOINT_PREFIXES = ("/job", "/send", "/content")
+
+
+def _logged_in() -> bool:
+    return session.get("authed") is True
+
+
+@app.before_request
+def require_login():
+    if not AUTH_ENABLED or _logged_in():
+        return None
+    if request.endpoint in ("login", "static"):
+        return None
+    if request.path.startswith(_JSON_ENDPOINT_PREFIXES):
+        return jsonify({"ok": False, "error": "Not authenticated"}), 401
+    return redirect(url_for("login", next=request.full_path.rstrip("?")))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if not AUTH_ENABLED:
+        return redirect(url_for("index"))
+    if request.method == "GET" and _logged_in():
+        return redirect(url_for("index"))
+
+    error = None
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        user_ok = hmac.compare_digest(username.encode("utf-8"), APP_USERNAME.encode("utf-8"))
+        pass_ok = hmac.compare_digest(password.encode("utf-8"), APP_PASSWORD.encode("utf-8"))
+        if user_ok and pass_ok:
+            session.clear()
+            session["authed"] = True
+            session.permanent = True
+            dest = request.args.get("next") or url_for("index")
+            # Only allow relative destinations (no open redirects)
+            if not dest.startswith("/") or dest.startswith("//"):
+                dest = url_for("index")
+            return redirect(dest)
+        error = "Invalid username or password."
+        log.warning("Failed login attempt (username=%r)", username)
+
+    return render_template("login.html", error=error, username=APP_USERNAME)
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
 
 def get_all_uploaded_files() -> list[dict[str, Any]]:
@@ -115,6 +174,7 @@ def index():
 
     return render_template(
         "index.html",
+        auth_enabled=AUTH_ENABLED,
         all_files=get_all_uploaded_files(),
         uploaded=uploaded,
         filename=filename,
@@ -364,4 +424,7 @@ def cancel_job(job_id):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # Debugger off by default (remote code execution risk on 0.0.0.0).
+    # Opt in for local dev only via FLASK_DEBUG=true.
+    debug = os.getenv("FLASK_DEBUG", "").strip().lower() in ("1", "true", "yes")
+    app.run(host="0.0.0.0", port=5000, debug=debug)

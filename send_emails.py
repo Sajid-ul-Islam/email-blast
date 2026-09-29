@@ -90,10 +90,7 @@ def main() -> None:
     print("-" * 60)
 
     if args.dry_run:
-        from sender import personalize
-
         for i, r in enumerate(recipients, 1):
-            body = personalize(BODY, r)
             print(f"[{i:>4}] would send to {r['email']}  (name={r['name']!r})")
         print("-" * 60)
         print(f"Total: {len(recipients)} emails (NOT sent — dry run)")

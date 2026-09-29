@@ -523,6 +523,65 @@ header h1 {
   font-size: 13.5px;
 }
 
+/* Login page */
+.container-narrow {
+  max-width: 420px;
+}
+
+.login-card {
+  margin-top: 8px;
+}
+
+.login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.login-form .field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.login-form label {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.login-form .input {
+  font-family: inherit;
+  font-size: 14px;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--text);
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+
+.login-form .input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+}
+
+.btn-block {
+  width: 100%;
+}
+
+/* Header auth row (logout) */
+.header-auth {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: -18px;
+}
+
+.header-auth form {
+  display: inline;
+}
+
 /* Responsive */
 @media (max-width: 600px) {
   .container {

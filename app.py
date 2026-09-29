@@ -1,25 +1,29 @@
 """app.py -- Email Blast Flask web application."""
 from __future__ import annotations
 
-import csv
-import io
 import json
 import logging
 import os
 import threading
-import urllib.request
 import uuid
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
+from typing import Any
+
+from dotenv import load_dotenv
+
+# Load .env BEFORE importing sender (which reads SMTP_HOST/SMTP_PORT at
+# import time) and before the os.getenv() defaults below.
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 from flask import (
     Flask, abort, flash, jsonify, redirect,
     render_template, request, send_from_directory, session, url_for
 )
 from sender import (
-    SendResult, build_from_address, categorize_smtp_error,
-    parse_recipients, parse_content_upload, personalize,
-    send_campaign, validate_credentials
+    parse_recipients, parse_content_upload,
+    send_campaign,
 )
 
 app = Flask(__name__)
@@ -275,7 +279,7 @@ def send_route():
         try:
             results = send_campaign(
                 gmail_user=gmail_user,
-                gmail_app_password=gmail_pass,
+                gmail_password=gmail_pass,
                 recipients=recipients,
                 subject=subject,
                 body_template=body,

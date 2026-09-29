@@ -89,7 +89,41 @@ with tempfile.TemporaryDirectory() as td:
     r = anon.get("/login")
     check("GET /login redirects to app when auth disabled", r.status_code == 302)
 
-# --- 6. send_campaign kwarg fix still binds correctly ---
+# --- 6. Login rate limiting ---
+importlib.reload(app_module)
+app_module.app.config["TESTING"] = True
+app_module.LOGIN_MAX_ATTEMPTS = 3
+app_module.LOGIN_WINDOW_SECONDS = 300.0
+app_module.LOGIN_LOCKOUT_SECONDS = 900.0
+
+rl = app_module.app.test_client()
+# Attempt 1-2: normal 200 with an error message
+for i in range(2):
+    r = rl.post("/login", data={"username": "admin", "password": "nope"})
+    check(f"failed login #{i + 1} below lockout returns 200",
+          r.status_code == 200 and b"Invalid username or password" in r.data)
+# Attempt 3: triggers lockout
+r = rl.post("/login", data={"username": "admin", "password": "nope"})
+check("failed login at max attempts returns 429 with lockout message",
+      r.status_code == 429 and b"Too many failed attempts" in r.data)
+# Even the CORRECT password is rejected while locked
+r = rl.post("/login", data={"username": "admin", "password": "test-pass-123"})
+check("correct password rejected while IP locked", r.status_code == 429)
+# A different simulated IP is not affected
+with app_module.app.test_request_context("/login", environ_base={"REMOTE_ADDR": "203.0.113.9"}):
+    check("other IP unaffected by lockout", app_module._login_is_locked("203.0.113.9") == 0.0)
+# Correct password from a clean IP succeeds
+rl2 = app_module.app.test_client()
+rl2.environ_base["REMOTE_ADDR"] = "203.0.113.9"
+r = rl2.post("/login", data={"username": "admin", "password": "test-pass-123"})
+check("correct password from clean IP succeeds during another IP's lockout", r.status_code == 302)
+# Successful login resets failure count: lock the IP again, then simulate reset
+rl2.environ_base["REMOTE_ADDR"] = "127.0.0.1"
+app_module._login_reset("127.0.0.1")
+r = rl2.post("/login", data={"username": "admin", "password": "wrong"})
+check("after reset, single failure is not locked out", r.status_code == 200)
+
+# --- 7. send_campaign kwarg fix still binds correctly ---
 os.environ["APP_PASSWORD"] = "test-pass-123"
 import importlib
 importlib.reload(app_module)

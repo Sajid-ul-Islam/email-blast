@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import threading
+import time as _time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -74,6 +75,64 @@ _cancel_events_lock = threading.Lock()
 # login redirect so the client can surface a clean error.
 _JSON_ENDPOINT_PREFIXES = ("/job", "/send", "/content")
 
+# ---------------------------------------------------------------------------
+# Login rate limiting -- slows down password guessing. In-process only,
+# which is fine for the single-process Flask deployment this app targets.
+# Tunable via .env: LOGIN_MAX_ATTEMPTS, LOGIN_WINDOW_SECONDS, LOGIN_LOCKOUT_SECONDS
+# ---------------------------------------------------------------------------
+LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "5"))
+LOGIN_WINDOW_SECONDS = float(os.getenv("LOGIN_WINDOW_SECONDS", "300"))
+LOGIN_LOCKOUT_SECONDS = float(os.getenv("LOGIN_LOCKOUT_SECONDS", "900"))
+_login_attempts: dict[str, list[float]] = {}
+_login_locks: dict[str, float] = {}
+_login_limit_lock = threading.Lock()
+
+
+def _client_ip() -> str:
+    """Best-effort client IP for rate limiting (single deployment, no proxy chain)."""
+    return request.remote_addr or "unknown"
+
+
+def _prune_login_state(now: float) -> None:
+    """Drop expired entries so the dicts cannot grow unbounded."""
+    expired_ips = [
+        ip for ip, stamps in _login_attempts.items()
+        if not stamps or now - stamps[-1] > max(LOGIN_WINDOW_SECONDS, LOGIN_LOCKOUT_SECONDS)
+    ]
+    for ip in expired_ips:
+        _login_attempts.pop(ip, None)
+    for ip in [ip for ip, until in _login_locks.items() if until <= now]:
+        _login_locks.pop(ip, None)
+
+
+def _login_is_locked(ip: str) -> float:
+    """Return remaining lockout seconds for this IP (0 = not locked)."""
+    now = _time.monotonic()
+    with _login_limit_lock:
+        _prune_login_state(now)
+        until = _login_locks.get(ip, 0.0)
+        return max(0.0, until - now)
+
+
+def _login_record_failure(ip: str) -> float:
+    """Record a failed attempt; return remaining lockout seconds (0 = not locked)."""
+    now = _time.monotonic()
+    with _login_limit_lock:
+        stamps = [t for t in _login_attempts.get(ip, []) if now - t < LOGIN_WINDOW_SECONDS]
+        stamps.append(now)
+        _login_attempts[ip] = stamps
+        if len(stamps) >= LOGIN_MAX_ATTEMPTS:
+            _login_locks[ip] = now + LOGIN_LOCKOUT_SECONDS
+            _login_attempts.pop(ip, None)
+            return LOGIN_LOCKOUT_SECONDS
+        return 0.0
+
+
+def _login_reset(ip: str) -> None:
+    with _login_limit_lock:
+        _login_attempts.pop(ip, None)
+        _login_locks.pop(ip, None)
+
 
 def _logged_in() -> bool:
     return session.get("authed") is True
@@ -97,13 +156,23 @@ def login():
     if request.method == "GET" and _logged_in():
         return redirect(url_for("index"))
 
+    ip = _client_ip()
+
     error = None
     if request.method == "POST":
+        remaining = _login_is_locked(ip)
+        if remaining > 0:
+            minutes = int(remaining // 60) + 1
+            log.warning("Rate-limited login attempt from %s", ip)
+            error = f"Too many failed attempts. Try again in ~{minutes} minute(s)."
+            return render_template("login.html", error=error, username=APP_USERNAME), 429
+
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
         user_ok = hmac.compare_digest(username.encode("utf-8"), APP_USERNAME.encode("utf-8"))
         pass_ok = hmac.compare_digest(password.encode("utf-8"), APP_PASSWORD.encode("utf-8"))
         if user_ok and pass_ok:
+            _login_reset(ip)
             session.clear()
             session["authed"] = True
             session.permanent = True
@@ -112,8 +181,9 @@ def login():
             if not dest.startswith("/") or dest.startswith("//"):
                 dest = url_for("index")
             return redirect(dest)
+        _login_record_failure(ip)
         error = "Invalid username or password."
-        log.warning("Failed login attempt (username=%r)", username)
+        log.warning("Failed login attempt (username=%r) from %s", username, ip)
 
     return render_template("login.html", error=error, username=APP_USERNAME)
 

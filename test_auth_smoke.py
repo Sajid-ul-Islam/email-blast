@@ -90,6 +90,7 @@ with tempfile.TemporaryDirectory() as td:
     check("GET /login redirects to app when auth disabled", r.status_code == 302)
 
 # --- 6. Login rate limiting ---
+os.environ["APP_PASSWORD"] = "test-pass-123"  # restore before reload (section 5 cleared it)
 importlib.reload(app_module)
 app_module.app.config["TESTING"] = True
 app_module.LOGIN_MAX_ATTEMPTS = 3
@@ -102,9 +103,13 @@ for i in range(2):
     r = rl.post("/login", data={"username": "admin", "password": "nope"})
     check(f"failed login #{i + 1} below lockout returns 200",
           r.status_code == 200 and b"Invalid username or password" in r.data)
-# Attempt 3: triggers lockout
+# Attempt 3: triggers the lockout (still gets the normal invalid-creds response)
 r = rl.post("/login", data={"username": "admin", "password": "nope"})
-check("failed login at max attempts returns 429 with lockout message",
+check("failed login at max attempts still returns 200 with invalid-creds message",
+      r.status_code == 200 and b"Invalid username or password" in r.data)
+# Attempt 4: now locked out, even with the CORRECT password
+r = rl.post("/login", data={"username": "admin", "password": "test-pass-123"})
+check("attempt while locked returns 429 with lockout message",
       r.status_code == 429 and b"Too many failed attempts" in r.data)
 # Even the CORRECT password is rejected while locked
 r = rl.post("/login", data={"username": "admin", "password": "test-pass-123"})

@@ -16,7 +16,6 @@ What's new vs. the original:
 
 from __future__ import annotations
 
-import base64
 import csv
 import hashlib
 import hmac
@@ -428,23 +427,28 @@ UNSUBSCRIBE_TOKEN_TTL_SECONDS = 2 * 365 * 24 * 3600
 
 
 def make_unsubscribe_token(email: str, secret: str) -> str:
-    """Return a URL-safe signed token authorizing opt-out for `email`."""
+    """Return a signed opt-out token for `email`.
+
+    Format: 8 hex digits of expiry + 32 hex digits of HMAC-SHA256 — pure
+    lowercase hex by design. Base64 tokens can contain '-'/'_', which forces
+    mail libraries to RFC 2047-encode the whole List-Unsubscribe header;
+    recipients' clients would then see an undecodable blob. Hex keeps the
+    header raw ASCII on the wire.
+    """
     exp = int(time.time()) + UNSUBSCRIBE_TOKEN_TTL_SECONDS
     msg = f"{email.strip().lower()}:{exp}"
     sig = hmac.new(secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
-    return base64.urlsafe_b64encode(f"{exp}:{sig}".encode("utf-8")).decode("ascii").rstrip("=")
+    return f"{exp:08x}{sig}"
 
 
 def verify_unsubscribe_token(email: str, token: str, secret: str) -> bool:
     """True when `token` is a valid, unexpired signature for `email`."""
-    if not email or not token or not secret:
+    if not email or not token or not secret or len(token) != 40:
         return False
     try:
-        padded = token + "=" * (-len(token) % 4)
-        raw = base64.urlsafe_b64decode(padded.encode("ascii")).decode("ascii")
-        exp_str, sig = raw.split(":", 1)
-        exp = int(exp_str)
-    except Exception:
+        exp = int(token[:8], 16)
+        sig = token[8:]
+    except ValueError:
         return False
     if exp < time.time():
         return False
@@ -454,10 +458,17 @@ def verify_unsubscribe_token(email: str, token: str, secret: str) -> bool:
 
 
 def build_unsubscribe_url(template: str, recipient: dict[str, Any], secret: str = "") -> str:
-    """Resolve {{email}} (URL-encoded) and {{token}} (signed, if secret given)."""
+    """Resolve {{email}} (URL-encoded) and {{token}} (signed, if secret given).
+
+    Also provides {{email_hex}} (hex of the address, no %/@/+ characters).
+    Use {{email_hex}} in List-Unsubscribe header URLs: a '%' anywhere in an
+    unstructured header makes email libraries RFC 2047-encode the entire
+    value, which mail clients cannot decode -- breaking one-click unsub.
+    """
     email = recipient.get("email", "")
     values = {
         "email": quote(email, safe=""),  # addresses with + or spaces stay valid in URLs
+        "emailhex": email.encode("utf-8").hex(),
         "token": make_unsubscribe_token(email, secret) if secret else "",
     }
     return _MERGE_FIELD_RE.sub(lambda m: values.get(_normalized_header(m.group(1)), ""), template)
@@ -804,6 +815,7 @@ def _build_message(
     html_body: str = "",
     attachments: list[Path] | None = None,
     unsubscribe_url: str = "",
+    list_unsubscribe_url: str = "",
 ) -> Any:
     """
     Build an email message object.
@@ -833,7 +845,10 @@ def _build_message(
                 if re.search(r"</body\s*>", html, re.IGNORECASE) \
                 else html + unsub_html
 
-    lu_header = f"<{unsubscribe_url}>" if unsubscribe_url else ""
+    # List-Unsubscribe header: prefer the RFC 8058 one-click POST endpoint;
+    # fall back to the human GET link. Footer always uses the GET link.
+    header_url = list_unsubscribe_url or unsubscribe_url
+    lu_header = f"<{header_url}>" if header_url else ""
 
     if attachments:
         msg = MIMEMultipart("mixed")
@@ -844,7 +859,8 @@ def _build_message(
         msg["Message-ID"] = make_msgid(domain=_message_id_domain(from_addr))
         if lu_header:
             msg["List-Unsubscribe"] = lu_header
-            msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+            if list_unsubscribe_url:
+                msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
 
         alt = MIMEMultipart("alternative")
         alt.attach(MIMEText(plain, "plain", "utf-8"))
@@ -871,10 +887,15 @@ def _build_message(
         msg["Message-ID"] = make_msgid(domain=(from_addr.split("@")[-1].rstrip(">") or "localhost"))
         if lu_header:
             msg["List-Unsubscribe"] = lu_header
-            msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+            if list_unsubscribe_url:
+                msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
         msg.set_content(plain, subtype="plain", charset="utf-8")
         if html:
             msg.add_alternative(html, subtype="html", charset="utf-8")
+        # Unsubscribe URLs exceed the default 78-char fold limit; folding an
+        # unstructured header makes the email library RFC 2047-encode the
+        # whole value, which mail clients cannot decode. SMTP allows 998.
+        msg.policy = msg.policy.clone(max_line_length=998)
 
     return msg
 
@@ -901,6 +922,7 @@ def send_campaign(
     from_name: str = "",
     unsubscribe_url: str = "",
     unsubscribe_secret: str = "",
+    list_unsubscribe_url: str = "",
     attachments: list[Path] | None = None,
 ) -> list[SendResult]:
     """
@@ -912,10 +934,12 @@ def send_campaign(
     Parameters
     ----------
     from_name       : Display name for the From header.
-    unsubscribe_url : Appended as footer + List-Unsubscribe header.
-                      Supports {{email}} (URL-encoded automatically) and
-                      {{token}} (signed, requires unsubscribe_secret).
+    unsubscribe_url : Human GET link in the footer. Supports {{email}}
+                      (URL-encoded) and {{token}} (signed).
     unsubscribe_secret : HMAC secret for {{token}} in unsubscribe links.
+    list_unsubscribe_url : Template for the List-Unsubscribe header (the
+                      RFC 8058 one-click POST endpoint). Supports {{email}}
+                      and {{token}}. When set, List-Unsubscribe-Post is added.
     attachments     : Files to attach to every email. A missing/unreadable
                       attachment fails the send loudly instead of sending
                       without it.
@@ -976,6 +1000,7 @@ def send_campaign(
         recipient: dict[str, Any],
         unsub: str,
         smtp: smtplib.SMTP | None,
+        list_unsub: str = "",
     ) -> tuple[SendResult, smtplib.SMTP | None]:
         """One send attempt on the given connection (new connection if None).
 
@@ -997,6 +1022,7 @@ def send_campaign(
                 html_body=html,
                 attachments=attachments,
                 unsubscribe_url=unsub,
+                list_unsubscribe_url=list_unsub,
             )
         except Exception as exc:
             return SendResult(recipient["email"], "failed", f"Could not build message: {exc}"), smtp
@@ -1017,9 +1043,10 @@ def send_campaign(
         recipient: dict[str, Any],
         unsub: str,
         smtp: smtplib.SMTP | None,
+        list_unsub: str = "",
     ) -> tuple[SendResult, smtplib.SMTP | None]:
         """Send with up to 2 reconnect attempts on dropped sessions."""
-        result, smtp = _send_once(recipient, unsub, smtp)
+        result, smtp = _send_once(recipient, unsub, smtp, list_unsub)
         if result.error == "__DISCONNECTED__":
             for _ in range(2):
                 result, smtp = _send_once(recipient, unsub, None)
@@ -1077,16 +1104,18 @@ def send_campaign(
                 _record(result)
                 continue
 
-            # Personalise unsubscribe URL per recipient: {{email}} is
-            # URL-encoded and {{token}} carries a signed opt-out (when a
-            # secret is configured).
+            # Personalise unsubscribe links per recipient: the footer link is
+            # human-facing; the header points at the signed one-click POST URL.
             if unsubscribe_url:
                 unsub = build_unsubscribe_url(unsubscribe_url, recipient, unsubscribe_secret)
             else:
                 unsub = ""
+            list_unsub = ""
+            if list_unsubscribe_url:
+                list_unsub = build_unsubscribe_url(list_unsubscribe_url, recipient, unsubscribe_secret)
 
             try:
-                result, smtp = _send_recipient(recipient, unsub, smtp)
+                result, smtp = _send_recipient(recipient, unsub, smtp, list_unsub)
             except Exception as exc:
                 # Reconnect+retries exhausted (e.g. auth revoked mid-run):
                 # stop instead of failing the rest one by one.
@@ -1126,7 +1155,7 @@ def send_campaign(
                     if cancel_event is not None and cancel_event.is_set():
                         break
                     try:
-                        result, smtp = _send_recipient(recipient, unsub, smtp)
+                        result, smtp = _send_recipient(recipient, unsub, smtp, list_unsub)
                     except Exception as exc:
                         connection_error = exc
                         break

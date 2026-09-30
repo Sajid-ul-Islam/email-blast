@@ -43,6 +43,7 @@ from sender import (  # noqa: E402
     SMTP_HOST,
     SMTP_PORT,
     build_unsubscribe_url,
+    count_today_sent,
     load_dotenv_once,
     load_suppressed_emails,
     parse_recipients,
@@ -68,6 +69,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Send emails via Gmail SMTP")
     parser.add_argument("--dry-run", action="store_true", help="Print intent only, send nothing")
     parser.add_argument("--list", default=None, help="Override EMAIL_LIST path")
+    parser.add_argument(
+        "--max-per-day", type=int, default=None,
+        help="Safety stop before the Gmail/Workspace daily cap "
+             "(default: MAX_PER_DAY env or 1950; Workspace standard = 2000/day)",
+    )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Skip recipients already recorded as sent today in sent_log.csv",
+    )
     args = parser.parse_args()
 
     list_path = Path(args.list) if args.list else HERE / EMAIL_LIST
@@ -94,6 +104,17 @@ def main() -> None:
         recipients = [r for r in recipients if r["email"].strip().lower() not in suppressed]
         print(f"Suppression list  : {SUPPRESSION_PATH}  ({len(suppressed)} entries, "
               f"{before - len(recipients)} recipient(s) skipped)")
+
+    # Daily-cap safety: max_per_day (default 1950, under Workspace's 2000/day)
+    # is enforced against sent_log.csv, so it survives restarts. The engine
+    # stops cleanly at the limit; --resume skips today's already-sent rows so
+    # the remainder can be sent the next run without duplicates.
+    max_per_day = args.max_per_day
+    if max_per_day is None:
+        max_per_day = int(os.getenv("MAX_PER_DAY", "1950").strip() or "1950")
+    if max_per_day < 0:
+        print(f"[ERROR] --max-per-day must be >= 0 (got {max_per_day})")
+        sys.exit(1)
 
     # Pre-flight merge-field check (R-C2): fail before sending rather than
     # delivering a literal {{field}} to every recipient.
@@ -123,9 +144,30 @@ def main() -> None:
                   f"{'  unsub=' + unsub if unsub else ''})")
         print("-" * 60)
         print(f"Total: {len(recipients)} emails (NOT sent — dry run)")
+        print(f"Daily cap         : {max_per_day} (today's sent so far: "
+              f"{count_today_sent(HERE / 'sent_log.csv')})")
         return
 
     log_path = HERE / "sent_log.csv"
+    sent_today = count_today_sent(log_path)
+    if args.resume:
+        before = len(recipients)
+        already = sent_today
+        recipients = recipients[already:] if already < before else []
+        print(f"Resume            : skipping first {min(already, before)} "
+              f"recipient(s) already sent today ({before - len(recipients)} skipped)")
+
+    print(f"Daily cap         : {max_per_day} (today's sent so far: {sent_today})")
+    if sent_today >= max_per_day:
+        print("[STOP] Daily safety cap already reached today. "
+              "Run again tomorrow (use --resume to skip today's sent rows).")
+        return
+    if sent_today + len(recipients) > max_per_day:
+        room = max_per_day - sent_today
+        print(f"[TRIM] List trimmed to today's remaining cap: "
+              f"{len(recipients)} -> {room} (rest stays for the next run with --resume)")
+        recipients = recipients[:room]
+
     results = send_campaign(
         GMAIL_USER,
         GMAIL_APP_PASSWORD,
@@ -134,6 +176,7 @@ def main() -> None:
         BODY,
         log_path=log_path,
         throttle_seconds=THROTTLE_SECONDS,
+        daily_cap=max_per_day,
         unsubscribe_url=UNSUBSCRIBE_URL,
         unsubscribe_secret=UNSUBSCRIBE_SECRET,
     )

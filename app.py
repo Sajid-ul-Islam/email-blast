@@ -27,7 +27,8 @@ from werkzeug.utils import secure_filename
 from sender import (
     parse_recipients, parse_content_upload,
     send_campaign, unknown_merge_fields,
-    append_to_suppression, load_suppressed_emails, verify_unsubscribe_token,
+    append_to_suppression, build_unsubscribe_url, load_suppressed_emails,
+    verify_unsubscribe_token,
 )
 
 app = Flask(__name__)
@@ -73,7 +74,68 @@ SUPPRESSION_PATH = Path(os.getenv("SUPPRESSION_PATH", str(BASE_DIR / "suppressio
 # after a restart, so set UNSUBSCRIBE_SECRET in .env for stable links.
 UNSUBSCRIBE_SECRET = os.getenv("UNSUBSCRIBE_SECRET", "").strip() or os.urandom(32).hex()
 
+# Retention: purge uploaded lists / content / job snapshots older than this.
+# Job JSONs and CSVs contain recipient PII (R-S1 scope); keep the window short.
+RETENTION_DAYS = float(os.getenv("RETENTION_DAYS", "14"))
+_retention_lock = threading.Lock()
+
+
+def _purge_stale_files() -> dict[str, int]:
+    """Delete uploads/content/job files older than RETENTION_DAYS. Returns counts."""
+    cutoff = _time.time() - RETENTION_DAYS * 86400.0
+    counts = {"uploads": 0, "content": 0, "jobs": 0}
+    with _retention_lock:
+        for key, directory in (("jobs", JOBS_DIR), ("content", CONTENT_DIR), ("uploads", UPLOADS_DIR)):
+            try:
+                candidates = list(directory.iterdir())
+            except OSError:
+                continue
+            for p in candidates:
+                try:
+                    # uploads/ top level only (never recurse into content/ or jobs/,
+                    # which get their own pass); job tmp files follow their json.
+                    if key == "uploads" and p.is_dir():
+                        continue
+                    if p.is_file() and p.stat().st_mtime < cutoff:
+                        p.unlink()
+                        counts[key] += 1
+                except OSError:
+                    continue
+    return counts
+
+
+def _retention_loop() -> None:
+    while True:
+        _time.sleep(6 * 3600)
+        try:
+            counts = _purge_stale_files()
+            if any(counts.values()):
+                log.info("Retention sweep removed %s", counts)
+        except Exception:
+            log.exception("Retention sweep failed")
+
 UNSUBSCRIBE_URL_DEFAULT = os.getenv("UNSUBSCRIBE_URL", "")
+
+
+def _one_click_url_template() -> str:
+    """List-Unsubscribe header template: signed one-click POST endpoint.
+
+    Uses {{email_hex}} (no %/@/+) so the header value stays raw ASCII on the
+    wire -- a single % would make email libraries RFC 2047-encode the whole
+    List-Unsubscribe header.
+    """
+    if not UNSUBSCRIBE_URL_DEFAULT:
+        return ""
+    base = UNSUBSCRIBE_URL_DEFAULT.split("?", 1)[0].rstrip("/")
+    return base + "/one-click?e={{email_hex}}&token={{token}}"
+
+
+def _one_click_url(email: str) -> str:
+    """Concrete RFC 8058 one-click POST endpoint for one recipient."""
+    tpl = _one_click_url_template()
+    if not tpl:
+        return ""
+    return build_unsubscribe_url(tpl, {"email": email}, UNSUBSCRIBE_SECRET)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -190,7 +252,9 @@ def _logged_in() -> bool:
 def require_login():
     if not AUTH_ENABLED or _logged_in():
         return None
-    if request.endpoint in ("login", "static"):
+    if request.endpoint in ("login", "static") or request.path.startswith("/unsubscribe"):
+        # /unsubscribe* is public by design: recipients clicking the link in
+        # their email have no session; the signed token is the authorization.
         return None
     if request.path.startswith(_JSON_ENDPOINT_PREFIXES):
         return jsonify({"ok": False, "error": "Not authenticated"}), 401
@@ -254,6 +318,53 @@ def unsubscribe_get():
     if not verify_unsubscribe_token(email, token, UNSUBSCRIBE_SECRET):
         return render_template("unsubscribe.html", ok=False, email=""), 403
     return render_template("unsubscribe.html", ok=True, email=email, confirm=True)
+
+
+@app.route("/unsubscribe/one-click", methods=["POST"])
+def unsubscribe_one_click():
+    """RFC 8058 one-click unsubscribe.
+
+    Mail clients POST List-Unsubscribe=One-Click with the List-Unsubscribe
+    body as the form value. Like /unsubscribe, this is deliberately public:
+    the request comes from the recipient's mail client, which has no app
+    session. The token proves the address itself authorized the opt-out.
+    """
+    raw = (request.form.get("List-Unsubscribe") or "").strip()
+    email_hex = (request.form.get("e") or request.form.get("email") or "").strip()
+    token = (request.form.get("token") or "").strip()
+    if not raw:
+        # Some clients post the bare value; accept the standard key too.
+        raw = (request.form.get("List-Unsubscribe-Post") or "").strip()
+
+    # The endpoint carries the address hex-encoded (see _one_click_url_template).
+    email = ""
+    try:
+        email = bytes.fromhex(email_hex).decode("utf-8") if email_hex else ""
+    except ValueError:
+        email = ""
+
+    ok = False
+    if raw and email and token:
+        # Extract the first <url> from "<http://...>, <http://...>"
+        m = re.search(r"<([^>]+)>", raw)
+        url = m.group(1) if m else raw
+        # Two checks:
+        # 1. the posted URL must be OUR one-click endpoint (path prefix) --
+        #    NOT a full regeneration: the token was minted at send time and
+        #    the client may POST it days later, so a time-based comparison
+        #    would always fail.
+        # 2. the token itself must be a valid, unexpired HMAC for this email.
+        base = UNSUBSCRIBE_URL_DEFAULT.split("?", 1)[0].rstrip("/")
+        endpoint_ok = bool(url) and url.startswith(base + "/one-click?")
+        auth_ok = verify_unsubscribe_token(email, token, UNSUBSCRIBE_SECRET)
+        ok = endpoint_ok and auth_ok
+    if not ok:
+        return jsonify({"ok": False, "error": "Invalid one-click request"}), 403
+
+    append_to_suppression(SUPPRESSION_PATH, email)
+    log.info("One-click suppression recorded for %s", email)
+    # RFC 8058: 2xx text response is enough.
+    return jsonify({"ok": True, "unsubscribed": email})
 
 
 @app.route("/unsubscribe", methods=["POST"])
@@ -533,6 +644,7 @@ def send_route():
                 from_name=from_name,
                 unsubscribe_url=unsub_url,
                 unsubscribe_secret=UNSUBSCRIBE_SECRET,
+                list_unsubscribe_url=_one_click_url_template(),
                 cancel_event=cancel_event,
                 daily_cap=DAILY_CAP_DEFAULT,
                 log_path=SENT_LOG_PATH,
@@ -632,4 +744,9 @@ if __name__ == "__main__":
             f"Refusing to bind to {HOST} without APP_PASSWORD set. "
             "Set APP_PASSWORD in .env, or keep HOST=127.0.0.1 for local use."
         )
+    # Startup retention sweep + periodic re-sweep (PII cleanup, R-S1 scope).
+    _startup_counts = _purge_stale_files()
+    if any(_startup_counts.values()):
+        log.info("Startup retention sweep removed %s", _startup_counts)
+    threading.Thread(target=_retention_loop, name="retention", daemon=True).start()
     app.run(host=HOST, port=PORT, debug=debug)

@@ -21,12 +21,14 @@ import mimetypes
 import os
 import re
 import smtplib
+import socket
 import time
 from email import encoders
 from email.message import EmailMessage
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import formatdate, make_msgid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -38,6 +40,11 @@ SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() not in ("false", "0", "no")
 FROM_NAME = os.getenv("FROM_NAME", "")
+
+# Default shared send log. The web app passes its own (same file by default),
+# so the daily cap holds across the CLI, web jobs, and restarts (rules.md R-O6).
+_default_log = Path(__file__).resolve().parent / "sent_log.csv"
+SENT_LOG_PATH = Path(os.getenv("SENT_LOG_PATH", str(_default_log)))
 
 
 def load_dotenv_once(path: Path | None = None) -> None:
@@ -92,6 +99,12 @@ def parse_recipients(filepath: Path) -> list[dict[str, Any]]:
         k for k in columns
         if k and k.strip().lower() in {"name", "fullname", "full_name", "customer_name"}
     }
+    # The chosen email column is exposed as the top-level "email" field;
+    # keep it out of `extra` so it does not double as a merge column.
+    email_keys = {
+        k for k in columns
+        if k and _normalized_header(str(k)) in _EMAIL_HEADER_NAMES
+    }
 
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -108,7 +121,10 @@ def parse_recipients(filepath: Path) -> list[dict[str, Any]]:
             name = str(row.get(k, "")).strip()
             if name:
                 break
-        extra = {k: v for k, v in row.items() if k and k.strip().lower() not in name_keys}
+        extra = {
+            k: v for k, v in row.items()
+            if k and k not in name_keys and k not in email_keys
+        }
         out.append({"email": email, "name": name, "extra": extra})
     return out
 
@@ -160,24 +176,71 @@ def _read_csv_rows(filepath: Path) -> list[dict[str, str]]:
         f.seek(0)
         try:
             sniffer = csv.Sniffer()
-            dialect = sniffer.sniff(sample)
-            has_header = sniffer.has_header(sample)
+            # Restricted delimiters: on small samples the sniffer can otherwise
+            # guess odd separators (colons, spaces) and shred the rows.
+            dialect = sniffer.sniff(sample, delimiters=",;\t")
         except Exception:
             dialect = csv.excel
+
+        # Header detection: csv.Sniffer.has_header() is unreliable on small
+        # recipient lists ("email,name" vs "a@x.com,A" both score 1.0), which
+        # used to drop real column names and replace them with col_0, col_1...
+        # The type-based check is decisive for our use case: a header row's
+        # cells are column NAMES, so no cell in it can look like an address.
+        first_line = sample.splitlines()[0] if sample else ""
+        try:
+            header_cells = next(csv.reader([first_line], dialect=dialect))
+            has_header = not any(_looks_like_email(str(c)) for c in header_cells)
+        except (StopIteration, csv.Error):
             has_header = True
 
         reader = csv.DictReader(f, dialect=dialect)
         if not has_header:
-            first = next(reader, None)
-            if first is not None:
+            first = next(reader, None)            if first is not None:
                 synthetic = [f"col_{i}" for i in range(len(first))]
                 f.seek(0)
                 reader = csv.DictReader(f, fieldnames=synthetic)
         return list(reader)
 
 
+def _normalized_header(s: str) -> str:
+    """Lowercase and strip separators so 'E-mail_Address' == 'emailaddress'."""
+    return re.sub(r"[\s_\-]+", "", s.strip().lower())
+
+
+# Headers that explicitly name the recipient's own email address.
+_EMAIL_HEADER_NAMES = {"email", "mail", "emailaddress"}
+
+# Column names that hold SOMEONE ELSE'S address (referrer, backup, ...) --
+# never auto-selected, because sending there would mail the wrong person.
+_OTHER_PERSON_MARKERS = (
+    "referrer", "referral", "referer", "backup", "alternate", "altmail",
+    "manager", "emergency", "parent", "guardian", "replyto", "bounce",
+    "ccmail", "ccemail",
+)
+
+
 def _find_email(row: dict[str, str]) -> str | None:
-    for value in row.values():
+    """Pick the recipient's email address from a CSV row.
+
+    1. Prefer a column explicitly named for the recipient's address
+       (email, e-mail, mail, email_address...). This stops a
+       referrer_email column earlier in the row from winning.
+    2. Fall back to the first email-looking value in a column that is
+       not flagged as someone else's address (referrer_email,
+       backup_email, reply_to...). A generic address-ish column such as
+       contact_email still qualifies; if ONLY other-person columns
+       hold addresses, return None rather than guess.
+    """
+    for key, value in row.items():
+        if _normalized_header(str(key)) in _EMAIL_HEADER_NAMES:
+            candidate = str(value).strip()
+            if _looks_like_email(candidate):
+                return candidate
+    for key, value in row.items():
+        norm = _normalized_header(str(key))
+        if any(marker in norm for marker in _OTHER_PERSON_MARKERS):
+            continue
         candidate = str(value).strip()
         if _looks_like_email(candidate):
             return candidate
@@ -196,74 +259,189 @@ def _looks_like_email(candidate: str) -> bool:
 # Personalisation
 # ---------------------------------------------------------------------------
 
+# Merge field syntax: {{field}}, {{ field }}, case-insensitive.
+_MERGE_FIELD_RE = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
+
+
+def _recipient_field_values(recipient: dict[str, Any], extra_vars: dict | None = None) -> dict[str, str]:
+    """Lowercased field name -> resolved value for one recipient."""
+    values = {
+        _normalized_header(str(k)): str(v)
+        for k, v in (recipient.get("extra") or {}).items()
+    }
+    if extra_vars:
+        values.update({_normalized_header(str(k)): str(v) for k, v in extra_vars.items()})
+    # email/name are authoritative even if a CSV column collides.
+    values["email"] = recipient.get("email", "")
+    values["name"] = recipient.get("name", "")
+    return values
+
+
 def personalize(
     body_template: str,
     recipient: dict[str, Any],
     extra_vars: dict | None = None,
 ) -> str:
     """
-    Replace {{field}} merge fields with recipient data.
-    Supports: {{name}}, {{email}}, any CSV column key, and extra_vars.
+    Replace {{field}} merge fields with recipient data (rules.md R-C2).
+
+    Supports: {{email}}, {{name}}, any CSV column key, and extra_vars.
+    Lookup is case-insensitive ({{Name}} matches a 'name' column). A field
+    with no value for this recipient resolves to an empty string -- a
+    literal {{field}} is never sent.
     """
-    text = body_template
-    text = text.replace("{{email}}", recipient.get("email", ""))
-    name = recipient.get("name", "")
-    text = text.replace("{{name}}", name)
-    for key, value in recipient.get("extra", {}).items():
-        text = text.replace("{{" + key + "}}", str(value))
-    if extra_vars:
-        for key, value in extra_vars.items():
-            text = text.replace("{{" + key + "}}", str(value))
-    return text
+    if not body_template:
+        return body_template
+    values = _recipient_field_values(recipient, extra_vars)
+    return _MERGE_FIELD_RE.sub(lambda m: values.get(_normalized_header(m.group(1)), ""), body_template)
+
+
+def unknown_merge_fields(templates: list[str], known_fields: set[str]) -> list[str]:
+    """Return merge fields referenced in templates but missing from known_fields.
+
+    'email' and 'name' are always known (they resolve to '' when the CSV has
+    no such column). Use this before sending so a typo like {{city}} against
+    a 'town' column is caught instead of going to every recipient as ''.
+    """
+    known = {"email", "name"} | {_normalized_header(f) for f in known_fields}
+    unknown: list[str] = []
+    for template in templates:
+        if not template:
+            continue
+        for m in _MERGE_FIELD_RE.finditer(template):
+            field = _normalized_header(m.group(1))
+            if field and field not in known and field not in unknown:
+                unknown.append(field)
+    return unknown
 
 
 # ---------------------------------------------------------------------------
 # Error handling
 # ---------------------------------------------------------------------------
 
+# Replies seen in the wild (RFC 5321 + common extensions). Restricting code
+# extraction to this set stops numbers inside message text (queue IDs,
+# timestamps, '5000 recipients') from being read as SMTP status codes.
+_VALID_SMTP_CODES = {
+    "211", "214", "220", "221", "235", "250", "251", "252",
+    "334", "354",
+    "421", "431", "450", "451", "452", "454", "455", "458", "459", "465",
+    "500", "501", "502", "503", "504", "521", "523", "530", "534", "535",
+    "538", "550", "551", "552", "553", "554", "555",
+}
+# The lookbehinds reject number-like tokens around a code:
+#   'f450x'  (word char)   '2,450' (digit grouping)   '12:450:00' (odd clock)
+#   '<450.99@host>' is rejected on the right by (?!\.\d).
+# Real replies look like '450 4.2.0 ...' or "(450, 'reason')" and still match.
+_SMTP_CODE_RE = re.compile(r"(?<![\d,.:\w])([245]\d{2})\b(?!\.\d)")
+
+
+def _smtp_status_code(error: str) -> str:
+    """Extract the first plausible 3-digit SMTP status code from an error."""
+    for m in _SMTP_CODE_RE.finditer(error):
+        if m.group(1) in _VALID_SMTP_CODES:
+            return m.group(1)
+    return ""
+
+
 def categorize_smtp_error(error: str) -> dict[str, str]:
     """Return {code, category, hint} for a human-readable error display."""
     if not error:
         return {"code": "", "category": "unknown", "hint": ""}
     e = error.lower()
-    m = re.search(r"\b([245]\d\d)\b", error)
-    code = m.group(1) if m else ""
+    code = _smtp_status_code(error)
 
-    if code == "550" or any(x in e for x in ("does not exist", "no such user", "user unknown", "invalid recipient")):
-        return {"code": code, "category": "invalid_address", "hint": "Email address does not exist."}
-    if code == "552" or any(x in e for x in ("message too large", "exceeded size", "too big")):
-        return {"code": code, "category": "message_too_large", "hint": "Message or attachment is too large."}
-    if code == "553" or "not allowed" in e:
-        return {"code": code, "category": "policy_rejection", "hint": "Rejected by recipient mail policy."}
-    if code in ("421", "450", "451") or any(x in e for x in ("try again later", "rate limit", "greylisted", "too many")):
+    if code.startswith("5") and code not in ("500", "501", "502", "503", "504", "505"):
+        # Permanent 5xx: refine by the specific code before phrases.
+        if code == "550" or any(x in e for x in ("does not exist", "no such user", "user unknown", "invalid recipient", "recipient address rejected")):
+            return {"code": code, "category": "invalid_address", "hint": "Email address does not exist."}
+        if code == "552" or any(x in e for x in ("message too large", "exceeded size", "too big")):
+            return {"code": code, "category": "message_too_large", "hint": "Message or attachment is too large."}
+        if code == "553":
+            return {"code": code, "category": "policy_rejection", "hint": "Rejected by recipient mail policy."}
+        if code in ("530", "534", "535") or any(x in e for x in (
+                "authentication required", "authenticationfailed", "auth failed",
+                "invalid credentials", "username and password", "app password",
+                "badcredentials", "please log in via your web browser")):
+            return {"code": code, "category": "auth_error", "hint": "Authentication failed. Check SMTP credentials."}
+        if any(x in e for x in ("spam", "blocked", "blacklist", "dnsbl", "junkmail")):
+            return {"code": code, "category": "spam_blocked", "hint": "Message blocked as spam."}
+        if code == "554" and "try again" in e:
+            return {"code": code, "category": "transient", "hint": "Temporary failure — retried automatically."}
+        return {"code": code, "category": "policy_rejection", "hint": "Permanently rejected by the mail server."}
+
+    if code.startswith("4") or any(x in e for x in (
+            "try again later", "rate limit", "greylist", "server busy",
+            "queue full", "temporary failure", "resources temporarily unavailable")):
         return {"code": code, "category": "transient", "hint": "Temporary failure — retried automatically."}
+
+    if code.startswith("2"):
+        # A 2xx string alone is not an error description; classify by text.
+        pass
+
     if any(x in e for x in ("spam", "blocked", "blacklist", "dnsbl")):
         return {"code": code, "category": "spam_blocked", "hint": "Message blocked as spam."}
-    if any(x in e for x in ("auth", "login", "credential", "535", "534")):
+    if any(x in e for x in (
+            "authentication required", "authenticationfailed", "auth failed",
+            "invalid credentials", "username and password", "app password",
+            "badcredentials")):
         return {"code": code, "category": "auth_error", "hint": "Authentication failed. Check SMTP credentials."}
-    if any(x in e for x in ("connection", "timeout", "network", "errno", "reset by peer")):
+    if any(x in e for x in ("connection", "timeout", "timed out", "network", "errno", "reset by peer", "disconnected")):
         return {"code": code, "category": "connection_error", "hint": "Connection to SMTP server failed."}
     return {"code": code, "category": "other", "hint": error[:120]}
 
 
 def is_transient_error(error: str) -> bool:
+    """True for errors worth retrying: any 4xx code, or a drop/timeout phrase.
+
+    Codes are extracted with _smtp_status_code (validated, boundary-anchored)
+    instead of substring matching, so '450' inside a queue ID or a timestamp
+    no longer reads as an SMTP status.
+    """
     if not error:
         return False
+    code = _smtp_status_code(error)
+    if code.startswith("4"):
+        return True
     e = error.lower()
-    markers = [
-        "try again", "too many connections", "rate limit", "421", "450", "451",
-        "timeout", "connection reset", "temporary", "greylisted", "server busy",
-        "queue full", "timed out", "errno 110", "errno 104",
+    phrases = [
+        "try again", "too many connections", "rate limit",
+        "timeout", "timed out", "connection reset", "connection refused",
+        "temporary failure", "resources temporarily unavailable",
+        "greylist", "server busy", "queue full",
+        # Server may close the session between sends; treat as transient so
+        # the recipient is retried after a fresh connection.
+        "server disconnected", "connection unexpectedly closed",
+        "bad handshake", "broken pipe", "not connected",
+        "reset by peer", "errno",
     ]
-    return any(m in e for m in markers)
+    return any(p in e for p in phrases)
+
+
+_TRANSIENT_SMTP_CODE_RE = re.compile(r"^4\d\d")
+
+
+def _is_disconnect_error(exc: BaseException) -> bool:
+    """True when the exception means the SMTP session is no longer usable."""
+    if isinstance(exc, (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError)):
+        return True
+    if isinstance(exc, (OSError, socket.timeout, TimeoutError, EOFError)):
+        # smtplib wraps many drops in plain OSError / socket.timeout.
+        return True
+    if isinstance(exc, smtplib.SMTPResponseException):
+        # A 4xx session-level reply usually means the session is unusable.
+        return _TRANSIENT_SMTP_CODE_RE.match(str(exc.smtp_code)) is not None
+    return False
 
 
 # ---------------------------------------------------------------------------
 # Log helpers
 # ---------------------------------------------------------------------------
 
-def count_today_sent(log_path: Path) -> int:
+def count_today_sent(log_path: Path | None) -> int:
     """Count rows with status=sent logged today (UTC) in a CSV log."""
+    if not log_path:
+        log_path = SENT_LOG_PATH
     if not log_path or not log_path.exists():
         return 0
     today = datetime.now(timezone.utc).date().isoformat()
@@ -460,6 +638,9 @@ def _build_message(
       With attachments: MIMEMultipart/mixed
                           multipart/alternative (plain + html)
                           attachment(s)
+
+    Raises ValueError when an attachment cannot be read -- the send must not
+    silently go out without a file the operator explicitly attached.
     """
     plain = plain_body
     html = html_body
@@ -498,20 +679,19 @@ def _build_message(
             p = Path(filepath)
             mime_type, _ = mimetypes.guess_type(str(p))
             maintype, subtype = (mime_type or "application/octet-stream").split("/", 1)
-            try:
-                with p.open("rb") as f:
-                    part = MIMEBase(maintype, subtype)
-                    part.set_payload(f.read())
-                    encoders.encode_base64(part)
-                    part.add_header("Content-Disposition", "attachment", filename=p.name)
-                    msg.attach(part)
-            except Exception:
-                pass
+            with p.open("rb") as f:
+                part = MIMEBase(maintype, subtype)
+                part.set_payload(f.read())
+                encoders.encode_base64(part)
+                part.add_header("Content-Disposition", "attachment", filename=p.name)
+                msg.attach(part)
     else:
         msg = EmailMessage()
         msg["From"] = from_addr
         msg["To"] = to
         msg["Subject"] = subject
+        msg["Date"] = formatdate(localtime=False, usegmt=True)
+        msg["Message-ID"] = make_msgid(domain=(from_addr.split("@")[-1].rstrip(">") or "localhost"))
         if lu_header:
             msg["List-Unsubscribe"] = lu_header
             msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
@@ -548,13 +728,19 @@ def send_campaign(
     """
     Send one email per recipient with full rate limiting and cancellation.
 
+    Opens a fresh SMTP connection per send and reconnects transparently, so a
+    long-paced campaign survives the server dropping the idle session.
+
     Parameters
     ----------
     from_name       : Display name for the From header.
     unsubscribe_url : Appended as footer + List-Unsubscribe header.
                       Supports {{email}} merge field.
-    attachments     : Files to attach to every email.
-    cancel_event    : threading.Event -- stops cleanly when set.
+    attachments     : Files to attach to every email. A missing/unreadable
+                      attachment fails the send loudly instead of sending
+                      without it.
+    cancel_event    : threading.Event -- stops cleanly when set. Waits between
+                      sends wake up immediately on cancel.
     """
     missing = validate_credentials(gmail_user, gmail_password)
     if missing:
@@ -577,76 +763,156 @@ def send_campaign(
         pace_mode=pace_mode,
         pace_seconds=pace_seconds,
         emails_per_hour=emails_per_hour,
-        sent_today=count_today_sent(log_path) if log_path else 0,
+        sent_today=count_today_sent(log_path),
     )
     limiter.set_list_size(len(recipients))
 
-    # Connect using configurable SMTP settings
-    smtp = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
-    try:
-        smtp.ehlo()
-        if SMTP_USE_TLS:
-            smtp.starttls()
-            smtp.ehlo()
-        smtp.login(gmail_user, gmail_password)
-    except Exception as exc:
-        err = f"SMTP login failed ({SMTP_HOST}:{SMTP_PORT}): {exc}"
-        results = [SendResult(r["email"], "failed", err) for r in recipients]
-        if on_result:
-            for r in results:
-                on_result(r)
-        return results
+    # One connection per send: idle SMTP sessions are routinely dropped after a
+    # few minutes, which would otherwise fail every remaining recipient.
+    def _connect() -> smtplib.SMTP:
+        s = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
+        try:
+            s.ehlo()
+            if SMTP_USE_TLS:
+                s.starttls()
+                s.ehlo()
+            s.login(gmail_user, gmail_password)
+            return s
+        except BaseException:
+            try:
+                s.quit()
+            except Exception:
+                pass
+            raise
 
-    results: list[SendResult] = []
-    retry_queue: list[dict[str, Any]] = []
+    def _close(s: smtplib.SMTP | None) -> None:
+        if s is not None:
+            try:
+                s.quit()
+            except Exception:
+                pass
 
-    def _send_recipient(recipient: dict, unsub: str) -> SendResult:
+    def _send_once(
+        recipient: dict[str, Any],
+        unsub: str,
+        smtp: smtplib.SMTP | None,
+    ) -> tuple[SendResult, smtplib.SMTP | None]:
+        """One send attempt on the given connection (new connection if None).
+
+        Returns (result, smtp). On a dead session, returns a sentinel result
+        and None so the caller reconnects and retries the same recipient.
+        """
         plain = personalize(body_template, recipient)
         html = personalize(html_body_template, recipient) if html_body_template else ""
-        msg = _build_message(
-            from_addr=from_addr,
-            to=recipient["email"],
-            subject=subject,
-            plain_body=plain,
-            html_body=html,
-            attachments=attachments,
-            unsubscribe_url=unsub,
-        )
         raw_from = from_addr.split("<")[-1].rstrip(">") if "<" in from_addr else from_addr
+
+        # Build the message outside the try: an unreadable attachment must fail
+        # the send loudly, not silently go out without the file.
         try:
-            smtp.sendmail(raw_from, [recipient["email"]], msg.as_string())
-            return SendResult(recipient["email"], "sent", "")
+            msg = _build_message(
+                from_addr=from_addr,
+                to=recipient["email"],
+                subject=subject,
+                plain_body=plain,
+                html_body=html,
+                attachments=attachments,
+                unsubscribe_url=unsub,
+            )
         except Exception as exc:
-            return SendResult(recipient["email"], "failed", str(exc))
+            return SendResult(recipient["email"], "failed", f"Could not build message: {exc}"), smtp
+
+        try:
+            if smtp is None:
+                smtp = _connect()
+            smtp.sendmail(raw_from, [recipient["email"]], msg.as_string())
+            return SendResult(recipient["email"], "sent", ""), smtp
+        except Exception as exc:
+            if _is_disconnect_error(exc):
+                _close(smtp)
+                # Sentinel: caller reconnects and retries this same recipient.
+                return SendResult(recipient["email"], "failed", "__DISCONNECTED__"), None
+            return SendResult(recipient["email"], "failed", str(exc)), smtp
+
+    def _send_recipient(
+        recipient: dict[str, Any],
+        unsub: str,
+        smtp: smtplib.SMTP | None,
+    ) -> tuple[SendResult, smtplib.SMTP | None]:
+        """Send with up to 2 reconnect attempts on dropped sessions."""
+        result, smtp = _send_once(recipient, unsub, smtp)
+        if result.error == "__DISCONNECTED__":
+            for _ in range(2):
+                result, smtp = _send_once(recipient, unsub, None)
+                if result.error != "__DISCONNECTED__":
+                    break
+            if result.error == "__DISCONNECTED__":
+                result = SendResult(
+                    recipient["email"], "failed",
+                    f"SMTP connection to {SMTP_HOST}:{SMTP_PORT} dropped repeatedly; giving up.",
+                )
+        return result, smtp
+
+    def _cancelable_wait(seconds: float) -> None:
+        """Sleep for `seconds`, returning early when cancel_event is set."""
+        if seconds <= 0:
+            return
+        if cancel_event is not None:
+            if cancel_event.wait(seconds):
+                return
+        else:
+            time.sleep(seconds)
+
+    def _record(result: SendResult) -> None:
+        """Emit to on_result and append to the shared CSV log exactly once."""
+        if on_result:
+            on_result(result)
+        if log_path is not None:
+            _append_log(log_path, result)
+
+    results: list[SendResult] = []
+    smtp: smtplib.SMTP | None = None
+    retry_queue: list[dict[str, Any]] = []
+    connection_error = None
 
     try:
         for i, recipient in enumerate(recipients, 1):
             if cancel_event is not None and cancel_event.is_set():
                 result = SendResult(recipient["email"], "skipped", "Job cancelled by user.")
                 results.append(result)
-                if on_result:
-                    on_result(result)
+                _record(result)
                 continue
 
             if not limiter.can_send():
                 err = f"Daily send cap ({limiter.daily_cap}) reached after {limiter.sent_today} emails."
                 result = SendResult(recipient["email"], "skipped", err)
                 results.append(result)
-                if on_result:
-                    on_result(result)
+                _record(result)
                 continue
 
             wait = limiter.wait_before_next()
-            if wait > 0:
-                time.sleep(wait)
+            _cancelable_wait(wait)
+            if cancel_event is not None and cancel_event.is_set():
+                result = SendResult(recipient["email"], "skipped", "Job cancelled by user.")
+                results.append(result)
+                _record(result)
+                continue
 
             # Personalise unsubscribe URL per recipient
             unsub = personalize(unsubscribe_url, recipient) if unsubscribe_url else ""
 
-            result = _send_recipient(recipient, unsub)
+            try:
+                result, smtp = _send_recipient(recipient, unsub, smtp)
+            except Exception as exc:
+                # Reconnect+retries exhausted (e.g. auth revoked mid-run):
+                # stop instead of failing the rest one by one.
+                connection_error = exc
+                break
 
             if result.status == "sent":
                 limiter.record_success()
+            elif result.error == "__DISCONNECTED__":
+                limiter.record_transient_failure()
+                retry_queue.append({"recipient": recipient, "unsub": unsub})
             elif is_transient_error(result.error):
                 limiter.record_transient_failure()
                 retry_queue.append({"recipient": recipient, "unsub": unsub})
@@ -654,60 +920,71 @@ def send_campaign(
                 limiter.record_permanent_failure()
 
             results.append(result)
-            if on_result:
-                on_result(result)
-            if log_path is not None:
-                _append_log(log_path, result)
+            _record(result)
 
         # Retry transient failures (up to 3 attempts each)
-        for entry in retry_queue:
-            if cancel_event is not None and cancel_event.is_set():
-                break
-            recipient = entry["recipient"]
-            unsub = entry.get("unsub", "")
-            if not limiter.can_send():
-                result = SendResult(recipient["email"], "skipped",
-                                    "Daily cap reached before retry.")
-                results.append(result)
-                if on_result:
-                    on_result(result)
-                continue
-            for attempt in range(1, 4):
-                wait = limiter.wait_before_next()
-                if wait > 0:
-                    time.sleep(wait)
-                result = _send_recipient(recipient, unsub)
-                if result.status == "sent":
-                    result.error = f"retry {attempt}"
-                    limiter.record_success()
-                    results.append(result)
-                    if on_result:
-                        on_result(result)
-                    if log_path is not None:
-                        _append_log(log_path, result)
+        if connection_error is None:
+            for entry in retry_queue:
+                if cancel_event is not None and cancel_event.is_set():
                     break
-                elif is_transient_error(result.error):
-                    limiter.record_transient_failure()
-                    time.sleep(limiter.effective_pace_seconds * limiter._backoff_multiplier)
+                recipient = entry["recipient"]
+                unsub = entry.get("unsub", "")
+                if not limiter.can_send():
+                    result = SendResult(recipient["email"], "skipped",
+                                        "Daily cap reached before retry.")
+                    results.append(result)
+                    _record(result)
+                    continue
+                for attempt in range(1, 4):
+                    wait = limiter.wait_before_next()
+                    _cancelable_wait(wait)
+                    if cancel_event is not None and cancel_event.is_set():
+                        break
+                    try:
+                        result, smtp = _send_recipient(recipient, unsub, smtp)
+                    except Exception as exc:
+                        connection_error = exc
+                        break
+                    if result.status == "sent":
+                        # Retry note kept out of `error` so a successful send is
+                        # never categorised as an error (categorize_smtp_error).
+                        result.note = f"sent on retry attempt {attempt}"
+                        limiter.record_success()
+                        results.append(result)
+                        _record(result)
+                        break
+                    elif result.error == "__DISCONNECTED__":
+                        limiter.record_transient_failure()
+                        continue
+                    elif is_transient_error(result.error):
+                        limiter.record_transient_failure()
+                        _cancelable_wait(
+                            limiter.effective_pace_seconds * limiter._backoff_multiplier
+                        )
+                    else:
+                        limiter.record_permanent_failure()
+                        results.append(result)
+                        _record(result)
+                        break
                 else:
-                    limiter.record_permanent_failure()
+                    result = SendResult(recipient["email"], "failed", "Max retries (3) exceeded")
                     results.append(result)
-                    if on_result:
-                        on_result(result)
-                    if log_path is not None:
-                        _append_log(log_path, result)
-                    break
-            else:
-                result = SendResult(recipient["email"], "failed", "Max retries (3) exceeded")
-                results.append(result)
-                if on_result:
-                    on_result(result)
-                if log_path is not None:
-                    _append_log(log_path, result)
+                    _record(result)
     finally:
-        try:
-            smtp.quit()
-        except Exception:
-            pass
+        _close(smtp)
+
+    if connection_error is not None:
+        # Mark the not-yet-attempted remainder as skipped, without recording
+        # duplicate failures for recipients that already have an outcome.
+        attempted = {r.email for r in results}
+        for recipient in recipients:
+            if recipient["email"] in attempted:
+                continue
+            result = SendResult(
+                recipient["email"], "skipped",
+                f"SMTP connection failed ({SMTP_HOST}:{SMTP_PORT}): {connection_error}",
+            )
+            results.append(result)
+            _record(result)
 
     return results

@@ -45,6 +45,7 @@ from sender import (  # noqa: E402
     load_dotenv_once,
     parse_recipients,
     send_campaign,
+    unknown_merge_fields,
     validate_credentials,
 )
 
@@ -79,6 +80,17 @@ def main() -> None:
     recipients = parse_recipients(list_path)
     if not recipients:
         print(f"[ERROR] No valid email addresses found in {list_path}")
+        sys.exit(1)
+
+    # Pre-flight merge-field check (R-C2): fail before sending rather than
+    # delivering a literal {{field}} to every recipient.
+    columns = set(recipients[0].get("extra", {}).keys()) if recipients else set()
+    unknown = unknown_merge_fields([SUBJECT, BODY], columns)
+    if unknown:
+        print("[ERROR] Unknown merge field(s) in SUBJECT/BODY:")
+        for f in unknown:
+            print(f"  - {{{{{f}}}}}")
+        print(f"Available CSV columns: {', '.join(sorted(columns)) or 'none'}")
         sys.exit(1)
 
     print(f"Sender            : {GMAIL_USER}")
@@ -117,7 +129,7 @@ def main() -> None:
         print("Failed recipients (for retry):")
         for r in results:
             if r.status == "failed":
-                print(f"  - {r['email']}  ({r.error})")
+                print(f"  - {r.email}  ({r.error})")
 
 
 if __name__ == "__main__":

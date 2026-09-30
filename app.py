@@ -5,6 +5,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import threading
 import time as _time
 import uuid
@@ -22,13 +23,19 @@ from flask import (
     Flask, abort, flash, jsonify, redirect,
     render_template, request, send_from_directory, session, url_for
 )
+from werkzeug.utils import secure_filename
 from sender import (
     parse_recipients, parse_content_upload,
-    send_campaign,
+    send_campaign, unknown_merge_fields,
 )
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024
+
+# Bind to loopback by default: with no APP_PASSWORD every route is open, and a
+# 0.0.0.0 bind would let anyone on the network send mail through this account.
+HOST = os.getenv("HOST", "127.0.0.1")
+PORT = int(os.getenv("PORT", "5000"))
 
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
@@ -53,6 +60,11 @@ SAMPLE_PATH = BASE_DIR / "sample_emails.csv"
 for _d in (UPLOADS_DIR, CONTENT_DIR, JOBS_DIR, ATTACH_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
+# Shared send log: enforces DAILY_CAP across web jobs AND the CLI, and the
+# count survives restarts (rules.md R-O6). Recipient PII stays local;
+# .gitignore already covers sent_log.csv.
+SENT_LOG_PATH = Path(os.getenv("SENT_LOG_PATH", str(BASE_DIR / "sent_log.csv")))
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
@@ -65,6 +77,32 @@ ALLOWED_ATTACH_EXTS = {
 
 _cancel_events: dict[str, threading.Event] = {}
 _cancel_events_lock = threading.Lock()
+
+_JOB_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+
+
+def safe_child(base: Path, name: str) -> Path | None:
+    """Resolve name under base; return it only if it is a file still under base.
+
+    Blocks path traversal such as file_id=../../.env.
+    """
+    p = (base / name).resolve()
+    return p if p.is_file() and p.is_relative_to(base.resolve()) else None
+
+
+_job_write_lock = threading.Lock()
+
+
+def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
+    """Write JSON via temp file + os.replace so pollers never read a torn file."""
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        # Windows: a concurrent reader can hold the destination open briefly.
+        _time.sleep(0.05)
+        os.replace(tmp, path)
 
 
 # ---------------------------------------------------------------------------
@@ -226,8 +264,8 @@ def index():
     preview_names = False
 
     if file_id:
-        filepath = UPLOADS_DIR / file_id
-        if filepath.exists() and filepath.is_file():
+        filepath = safe_child(UPLOADS_DIR, file_id)
+        if filepath is not None:
             uploaded = True
             filename = filepath.name
             try:
@@ -271,7 +309,7 @@ def upload_file():
         flash("Invalid file extension. Please upload a .csv file.")
         return redirect(url_for("index"))
 
-    safe_name = f"{uuid.uuid4().hex[:8]}_{Path(file.filename).name}"
+    safe_name = f"{uuid.uuid4().hex[:8]}_{secure_filename(file.filename) or f'file{ext}'}"
     save_path = UPLOADS_DIR / safe_name
     file.save(save_path)
 
@@ -288,13 +326,18 @@ def sample_csv():
 
 @app.route("/uploads/<path:filename>", methods=["GET"])
 def download_uploaded(filename):
-    return send_from_directory(UPLOADS_DIR, filename, as_attachment=True)
+    # Serve only recipient-list files sitting directly in uploads/. Never serve
+    # jobs/*.json (contains every recipient email + result) or content/ files.
+    p = safe_child(UPLOADS_DIR, filename)
+    if p is None or p.parent != UPLOADS_DIR or p.suffix.lower() not in ALLOWED_LIST_EXTS:
+        abort(404)
+    return send_from_directory(UPLOADS_DIR, p.name, as_attachment=True)
 
 
 @app.route("/preview/<file_id>", methods=["GET"])
 def preview_full(file_id):
-    filepath = UPLOADS_DIR / file_id
-    if not filepath.exists() or not filepath.is_file():
+    filepath = safe_child(UPLOADS_DIR, file_id)
+    if filepath is None:
         abort(404)
     recipients = parse_recipients(filepath)
     preview_names = any(bool(r.get("name")) for r in recipients)
@@ -319,7 +362,7 @@ def upload_content():
     if ext not in ALLOWED_CONTENT_EXTS:
         return jsonify({"ok": False, "error": f"Invalid format: {ext}. Allowed: .txt, .json, .html"}), 400
 
-    content_id = f"{uuid.uuid4().hex[:8]}_{Path(file.filename).name}"
+    content_id = f"{uuid.uuid4().hex[:8]}_{secure_filename(file.filename) or f'content{ext}'}"
     save_path = CONTENT_DIR / content_id
     file.save(save_path)
 
@@ -352,8 +395,8 @@ def send_route():
     if not body:
         return jsonify({"ok": False, "error": "Body cannot be empty"}), 400
 
-    list_path = UPLOADS_DIR / file_id
-    if not list_path.exists():
+    list_path = safe_child(UPLOADS_DIR, file_id)
+    if list_path is None:
         return jsonify({"ok": False, "error": "Recipient list file not found"}), 404
 
     try:
@@ -366,10 +409,28 @@ def send_route():
 
     html_body_template = None
     if content_file_id:
-        c_path = CONTENT_DIR / content_file_id
-        if c_path.exists() and c_path.suffix.lower() == ".html":
+        c_path = safe_child(CONTENT_DIR, content_file_id)
+        if c_path is not None and c_path.suffix.lower() == ".html":
             parsed = parse_content_upload(c_path)
             html_body_template = parsed.get("html_body")
+
+    # Validate merge fields against the CSV columns BEFORE starting the job,
+    # so a typo like {{city}} is rejected instead of going to every recipient
+    # (rules.md R-C2: unresolved fields must never reach a recipient).
+    columns = set(recipients[0].get("extra", {}).keys()) if recipients else set()
+    unknown = unknown_merge_fields(
+        [subject, body] + ([html_body_template] if html_body_template else []),
+        columns,
+    )
+    if unknown:
+        names = ", ".join("{{%s}}" % f for f in unknown[:8])
+        return jsonify({
+            "ok": False,
+            "error": (
+                f"Unknown merge field(s): {names}. "
+                f"Available columns: {', '.join(sorted(columns)) or 'none'}."
+            ),
+        }), 422
 
     job_id = uuid.uuid4().hex[:12]
     job_file = JOBS_DIR / f"{job_id}.json"
@@ -389,8 +450,22 @@ def send_route():
         "finished_at": None,
         "error": None,
     }
-    with open(job_file, "w", encoding="utf-8") as f:
-        json.dump(initial_job_data, f, indent=2)
+    _write_json_atomic(job_file, initial_job_data)
+
+    # Live progress: on_result updates counts + results and flushes the job
+    # file atomically after every send, so /job/<id>/status shows real numbers.
+    job_state = initial_job_data
+
+    def on_result(r) -> None:
+        with _job_write_lock:
+            job_state["results"].append(r.to_dict())
+            key = {"sent": "sent", "failed": "failed", "skipped": "skipped"}.get(r.status)
+            if key:
+                job_state[key] += 1
+            try:
+                _write_json_atomic(job_file, job_state)
+            except OSError as e:
+                log.warning("Could not update job file %s: %s", job_file, e)
 
     cancel_event = threading.Event()
     with _cancel_events_lock:
@@ -402,11 +477,11 @@ def send_route():
         from_name = os.getenv("FROM_NAME", FROM_NAME_DEFAULT)
         unsub_url = os.getenv("UNSUBSCRIBE_URL", UNSUBSCRIBE_URL_DEFAULT)
 
-        initial_job_data["status"] = "running"
-        with open(job_file, "w", encoding="utf-8") as f:
-            json.dump(initial_job_data, f, indent=2)
-
         try:
+            with _job_write_lock:
+                job_state["status"] = "running"
+                _write_json_atomic(job_file, job_state)
+
             results = send_campaign(
                 gmail_user=gmail_user,
                 gmail_password=gmail_pass,
@@ -418,26 +493,31 @@ def send_route():
                 unsubscribe_url=unsub_url,
                 cancel_event=cancel_event,
                 daily_cap=DAILY_CAP_DEFAULT,
+                log_path=SENT_LOG_PATH,
+                on_result=on_result,
             )
 
-            sent = sum(1 for r in results if r.status == "sent")
-            failed = sum(1 for r in results if r.status == "failed")
-            skipped = sum(1 for r in results if r.status == "skipped")
-
-            initial_job_data["sent"] = sent
-            initial_job_data["failed"] = failed
-            initial_job_data["skipped"] = skipped
-            initial_job_data["results"] = [r.to_dict() for r in results]
-            initial_job_data["status"] = "cancelled" if cancel_event.is_set() else "done"
-            initial_job_data["finished_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            # Recompute from the authoritative return value (on_result already
+            # streamed the same data; this corrects any drift).
+            with _job_write_lock:
+                job_state["sent"] = sum(1 for r in results if r.status == "sent")
+                job_state["failed"] = sum(1 for r in results if r.status == "failed")
+                job_state["skipped"] = sum(1 for r in results if r.status == "skipped")
+                job_state["results"] = [r.to_dict() for r in results]
+                job_state["status"] = "cancelled" if cancel_event.is_set() else "done"
+                job_state["finished_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         except Exception as e:
             log.exception("Campaign execution error")
-            initial_job_data["status"] = "error"
-            initial_job_data["error"] = str(e)
-            initial_job_data["finished_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            with _job_write_lock:
+                job_state["status"] = "error"
+                job_state["error"] = str(e)
+                job_state["finished_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         finally:
-            with open(job_file, "w", encoding="utf-8") as f:
-                json.dump(initial_job_data, f, indent=2)
+            with _job_write_lock:
+                try:
+                    _write_json_atomic(job_file, job_state)
+                except OSError as e:
+                    log.error("Could not write final job file %s: %s", job_file, e)
             with _cancel_events_lock:
                 _cancel_events.pop(job_id, None)
 
@@ -449,6 +529,8 @@ def send_route():
 
 @app.route("/job/<job_id>", methods=["GET"])
 def view_job(job_id):
+    if not _JOB_ID_RE.match(job_id):
+        abort(404)
     job_file = JOBS_DIR / f"{job_id}.json"
     if not job_file.exists():
         abort(404)
@@ -474,6 +556,8 @@ def view_job(job_id):
 
 @app.route("/job/<job_id>/status", methods=["GET"])
 def job_status(job_id):
+    if not _JOB_ID_RE.match(job_id):
+        abort(404)
     job_file = JOBS_DIR / f"{job_id}.json"
     if not job_file.exists():
         return jsonify({"ok": False, "error": "Job not found"}), 404
@@ -485,6 +569,8 @@ def job_status(job_id):
 
 @app.route("/job/<job_id>/cancel", methods=["POST"])
 def cancel_job(job_id):
+    if not _JOB_ID_RE.match(job_id):
+        abort(404)
     with _cancel_events_lock:
         ev = _cancel_events.get(job_id)
         if ev:
@@ -497,4 +583,11 @@ if __name__ == "__main__":
     # Debugger off by default (remote code execution risk on 0.0.0.0).
     # Opt in for local dev only via FLASK_DEBUG=true.
     debug = os.getenv("FLASK_DEBUG", "").strip().lower() in ("1", "true", "yes")
-    app.run(host="0.0.0.0", port=5000, debug=debug)
+    if not AUTH_ENABLED and HOST not in ("127.0.0.1", "localhost", "::1"):
+        # No password + a reachable interface = anyone on the network can send
+        # mail through this account. Refuse instead of starting wide open.
+        raise SystemExit(
+            f"Refusing to bind to {HOST} without APP_PASSWORD set. "
+            "Set APP_PASSWORD in .env, or keep HOST=127.0.0.1 for local use."
+        )
+    app.run(host=HOST, port=PORT, debug=debug)

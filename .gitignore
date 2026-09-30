@@ -1,9 +1,11 @@
 *.log
+*.pyc
+.env
 .sent_log.csv
+__pycache__/
+history-backup-before-scrub.bundle
+node_modules/
 sent_log.csv
+suppression.txt
 test_sent_log.csv
 uploads/
-.env
-node_modules/
-__pycache__/
-*.pyc

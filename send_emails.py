@@ -42,7 +42,9 @@ if str(HERE) not in sys.path:
 from sender import (  # noqa: E402
     SMTP_HOST,
     SMTP_PORT,
+    build_unsubscribe_url,
     load_dotenv_once,
+    load_suppressed_emails,
     parse_recipients,
     send_campaign,
     unknown_merge_fields,
@@ -57,6 +59,9 @@ EMAIL_LIST = os.getenv("EMAIL_LIST", "emails.csv").strip()
 SUBJECT = os.getenv("SUBJECT", "Hello from DEEN").strip()
 BODY = os.getenv("BODY", "Hello,\n\nThis is a test email from the email-blast sender.\n\nThanks,\nThe Team").strip()
 THROTTLE_SECONDS = float(os.getenv("THROTTLE_SECONDS", "0").strip() or "0")
+UNSUBSCRIBE_URL = os.getenv("UNSUBSCRIBE_URL", "").strip()
+UNSUBSCRIBE_SECRET = os.getenv("UNSUBSCRIBE_SECRET", "").strip()
+SUPPRESSION_PATH = Path(os.getenv("SUPPRESSION_PATH", str(HERE / "suppression.txt")))
 
 
 def main() -> None:
@@ -82,6 +87,14 @@ def main() -> None:
         print(f"[ERROR] No valid email addresses found in {list_path}")
         sys.exit(1)
 
+    # Honor opt-outs before anything else.
+    suppressed = load_suppressed_emails(SUPPRESSION_PATH)
+    if suppressed:
+        before = len(recipients)
+        recipients = [r for r in recipients if r["email"].strip().lower() not in suppressed]
+        print(f"Suppression list  : {SUPPRESSION_PATH}  ({len(suppressed)} entries, "
+              f"{before - len(recipients)} recipient(s) skipped)")
+
     # Pre-flight merge-field check (R-C2): fail before sending rather than
     # delivering a literal {{field}} to every recipient.
     columns = set(recipients[0].get("extra", {}).keys()) if recipients else set()
@@ -103,7 +116,11 @@ def main() -> None:
 
     if args.dry_run:
         for i, r in enumerate(recipients, 1):
-            print(f"[{i:>4}] would send to {r['email']}  (name={r['name']!r})")
+            unsub = ""
+            if UNSUBSCRIBE_URL:
+                unsub = build_unsubscribe_url(UNSUBSCRIBE_URL, r, UNSUBSCRIBE_SECRET)
+            print(f"[{i:>4}] would send to {r['email']}  (name={r['name']!r}"
+                  f"{'  unsub=' + unsub if unsub else ''})")
         print("-" * 60)
         print(f"Total: {len(recipients)} emails (NOT sent — dry run)")
         return
@@ -117,6 +134,8 @@ def main() -> None:
         BODY,
         log_path=log_path,
         throttle_seconds=THROTTLE_SECONDS,
+        unsubscribe_url=UNSUBSCRIBE_URL,
+        unsubscribe_secret=UNSUBSCRIBE_SECRET,
     )
 
     success = sum(1 for r in results if r.status == "sent")

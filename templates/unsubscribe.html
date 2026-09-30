@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Unsubscribe — Email Blast</title>
+  <style>
+    body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; background: #f3f4f6; margin: 0; }
+    .card { max-width: 460px; margin: 12vh auto; background: #fff; border-radius: 12px;
+            box-shadow: 0 4px 18px rgba(0,0,0,.08); padding: 40px 36px; text-align: center; }
+    h1 { font-size: 20px; margin: 0 0 10px; color: #111827; }
+    p  { color: #4b5563; font-size: 14px; line-height: 1.6; margin: 8px 0 20px; }
+    .email { font-weight: 600; color: #111827; word-break: break-all; }
+    button { background: #b91c1c; color: #fff; border: 0; border-radius: 8px;
+             padding: 11px 26px; font-size: 15px; cursor: pointer; }
+    button:hover { background: #991b1b; }
+    .done { color: #047857; font-weight: 600; }
+    .invalid { color: #b91c1c; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    {% if not ok %}
+      <h1>Link not valid</h1>
+      <p class="invalid">This unsubscribe link is invalid or has expired.</p>
+      <p>If you want to stop these emails, please reply to the message instead and ask to be removed.</p>
+    {% elif confirm %}
+      <h1>Unsubscribe?</h1>
+      <p>You are about to unsubscribe <span class="email">{{ email }}</span><br>
+         from all future emails sent with this tool.</p>
+      <form method="post" action="/unsubscribe">
+        <input type="hidden" name="email" value="{{ email }}">
+        <input type="hidden" name="token" value="{{ request.args.get('token', '') }}">
+        <button type="submit">Confirm unsubscribe</button>
+      </form>
+    {% else %}
+      <h1>You're unsubscribed</h1>
+      <p class="done">✔ <span class="email">{{ email }}</span> has been removed from the mailing list.</p>
+      <p>No further emails will be sent to this address.</p>
+    {% endif %}
+  </div>
+</body>
+</html>

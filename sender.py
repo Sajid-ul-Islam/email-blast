@@ -16,7 +16,10 @@ What's new vs. the original:
 
 from __future__ import annotations
 
+import base64
 import csv
+import hashlib
+import hmac
 import mimetypes
 import os
 import re
@@ -32,6 +35,7 @@ from email.utils import formatdate, make_msgid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 # ---------------------------------------------------------------------------
 # SMTP / identity config -- read from .env at runtime
@@ -313,6 +317,78 @@ def unknown_merge_fields(templates: list[str], known_fields: set[str]) -> list[s
             if field and field not in known and field not in unknown:
                 unknown.append(field)
     return unknown
+
+
+# ---------------------------------------------------------------------------
+# Unsubscribe tokens + suppression list
+# ---------------------------------------------------------------------------
+
+# Tokens are HMAC(email, secret) bound to an expiry, so an unsubscribe link
+# cannot be forged for an address the sender chose not to link.
+UNSUBSCRIBE_TOKEN_TTL_SECONDS = 2 * 365 * 24 * 3600
+
+
+def make_unsubscribe_token(email: str, secret: str) -> str:
+    """Return a URL-safe signed token authorizing opt-out for `email`."""
+    exp = int(time.time()) + UNSUBSCRIBE_TOKEN_TTL_SECONDS
+    msg = f"{email.strip().lower()}:{exp}"
+    sig = hmac.new(secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+    return base64.urlsafe_b64encode(f"{exp}:{sig}".encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def verify_unsubscribe_token(email: str, token: str, secret: str) -> bool:
+    """True when `token` is a valid, unexpired signature for `email`."""
+    if not email or not token or not secret:
+        return False
+    try:
+        padded = token + "=" * (-len(token) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode("ascii")).decode("ascii")
+        exp_str, sig = raw.split(":", 1)
+        exp = int(exp_str)
+    except Exception:
+        return False
+    if exp < time.time():
+        return False
+    msg = f"{email.strip().lower()}:{exp}"
+    expected = hmac.new(secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+    return hmac.compare_digest(sig, expected)
+
+
+def build_unsubscribe_url(template: str, recipient: dict[str, Any], secret: str = "") -> str:
+    """Resolve {{email}} (URL-encoded) and {{token}} (signed, if secret given)."""
+    email = recipient.get("email", "")
+    values = {
+        "email": quote(email, safe=""),  # addresses with + or spaces stay valid in URLs
+        "token": make_unsubscribe_token(email, secret) if secret else "",
+    }
+    return _MERGE_FIELD_RE.sub(lambda m: values.get(_normalized_header(m.group(1)), ""), template)
+
+
+def load_suppressed_emails(path: Path | None) -> set[str]:
+    """Lowercased emails from the suppression file (one per line)."""
+    if not path or not path.exists():
+        return set()
+    suppressed: set[str] = set()
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            entry = line.strip().lower()
+            if entry and not entry.startswith("#") and _looks_like_email(entry):
+                suppressed.add(entry)
+    except OSError:
+        pass
+    return suppressed
+
+
+def append_to_suppression(path: Path | None, email: str) -> None:
+    """Record an opt-out. File is append-only, addresses stored lowercased."""
+    if not path:
+        return
+    entry = email.strip().lower()
+    if not entry:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(entry + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -723,6 +799,7 @@ def send_campaign(
     cancel_event=None,
     from_name: str = "",
     unsubscribe_url: str = "",
+    unsubscribe_secret: str = "",
     attachments: list[Path] | None = None,
 ) -> list[SendResult]:
     """
@@ -735,7 +812,9 @@ def send_campaign(
     ----------
     from_name       : Display name for the From header.
     unsubscribe_url : Appended as footer + List-Unsubscribe header.
-                      Supports {{email}} merge field.
+                      Supports {{email}} (URL-encoded automatically) and
+                      {{token}} (signed, requires unsubscribe_secret).
+    unsubscribe_secret : HMAC secret for {{token}} in unsubscribe links.
     attachments     : Files to attach to every email. A missing/unreadable
                       attachment fails the send loudly instead of sending
                       without it.
@@ -897,8 +976,13 @@ def send_campaign(
                 _record(result)
                 continue
 
-            # Personalise unsubscribe URL per recipient
-            unsub = personalize(unsubscribe_url, recipient) if unsubscribe_url else ""
+            # Personalise unsubscribe URL per recipient: {{email}} is
+            # URL-encoded and {{token}} carries a signed opt-out (when a
+            # secret is configured).
+            if unsubscribe_url:
+                unsub = build_unsubscribe_url(unsubscribe_url, recipient, unsubscribe_secret)
+            else:
+                unsub = ""
 
             try:
                 result, smtp = _send_recipient(recipient, unsub, smtp)

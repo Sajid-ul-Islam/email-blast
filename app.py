@@ -27,6 +27,7 @@ from werkzeug.utils import secure_filename
 from sender import (
     parse_recipients, parse_content_upload,
     send_campaign, unknown_merge_fields,
+    append_to_suppression, load_suppressed_emails, verify_unsubscribe_token,
 )
 
 app = Flask(__name__)
@@ -40,7 +41,6 @@ PORT = int(os.getenv("PORT", "5000"))
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 FROM_NAME_DEFAULT = os.getenv("FROM_NAME", "")
-UNSUBSCRIBE_URL_DEFAULT = os.getenv("UNSUBSCRIBE_URL", "")
 WEBHOOK_URL_DEFAULT = os.getenv("WEBHOOK_URL", "")
 DAILY_CAP_DEFAULT = int(os.getenv("DAILY_CAP", "100"))
 APP_USERNAME = os.getenv("APP_USERNAME", "admin")
@@ -64,6 +64,16 @@ for _d in (UPLOADS_DIR, CONTENT_DIR, JOBS_DIR, ATTACH_DIR):
 # count survives restarts (rules.md R-O6). Recipient PII stays local;
 # .gitignore already covers sent_log.csv.
 SENT_LOG_PATH = Path(os.getenv("SENT_LOG_PATH", str(BASE_DIR / "sent_log.csv")))
+
+# Suppression list: addresses that must never be sent to (opt-outs). Append-only
+# local file; PII stays on disk and out of git via .gitignore.
+SUPPRESSION_PATH = Path(os.getenv("SUPPRESSION_PATH", str(BASE_DIR / "suppression.txt")))
+
+# Secret for signing unsubscribe tokens. Ephemeral default: links stop working
+# after a restart, so set UNSUBSCRIBE_SECRET in .env for stable links.
+UNSUBSCRIBE_SECRET = os.getenv("UNSUBSCRIBE_SECRET", "").strip() or os.urandom(32).hex()
+
+UNSUBSCRIBE_URL_DEFAULT = os.getenv("UNSUBSCRIBE_URL", "")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -230,6 +240,31 @@ def login():
 def logout():
     session.clear()
     return redirect(url_for("login"))
+
+
+# ---------------------------------------------------------------------------
+# Unsubscribe -- deliberately PUBLIC (no login): a recipient clicking the
+# link in their email has no app credentials. Opt-out is recorded locally
+# and the address is skipped by every future send.
+# ---------------------------------------------------------------------------
+@app.route("/unsubscribe", methods=["GET"])
+def unsubscribe_get():
+    email = request.args.get("email", "").strip()
+    token = request.args.get("token", "").strip()
+    if not verify_unsubscribe_token(email, token, UNSUBSCRIBE_SECRET):
+        return render_template("unsubscribe.html", ok=False, email=""), 403
+    return render_template("unsubscribe.html", ok=True, email=email, confirm=True)
+
+
+@app.route("/unsubscribe", methods=["POST"])
+def unsubscribe_post():
+    email = request.form.get("email", "").strip()
+    token = request.form.get("token", "").strip()
+    if not verify_unsubscribe_token(email, token, UNSUBSCRIBE_SECRET):
+        return render_template("unsubscribe.html", ok=False, email=""), 403
+    append_to_suppression(SUPPRESSION_PATH, email)
+    log.info("Suppression recorded for %s", email)
+    return render_template("unsubscribe.html", ok=True, email=email, confirm=False)
 
 
 def get_all_uploaded_files() -> list[dict[str, Any]]:
@@ -407,6 +442,12 @@ def send_route():
     if not recipients:
         return jsonify({"ok": False, "error": "No valid recipients found in file"}), 400
 
+    # Honor opt-outs before anything else (R-C2 / deliverability): suppressed
+    # addresses are reported as skipped, never contacted.
+    suppressed = load_suppressed_emails(SUPPRESSION_PATH)
+    if suppressed:
+        recipients = [r for r in recipients if r["email"].strip().lower() not in suppressed]
+
     html_body_template = None
     if content_file_id:
         c_path = safe_child(CONTENT_DIR, content_file_id)
@@ -491,6 +532,7 @@ def send_route():
                 html_body_template=html_body_template,
                 from_name=from_name,
                 unsubscribe_url=unsub_url,
+                unsubscribe_secret=UNSUBSCRIBE_SECRET,
                 cancel_event=cancel_event,
                 daily_cap=DAILY_CAP_DEFAULT,
                 log_path=SENT_LOG_PATH,

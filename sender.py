@@ -31,7 +31,8 @@ from email.message import EmailMessage
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.utils import formatdate, make_msgid
+from email.utils import formataddr, formatdate, make_msgid, parseaddr
+from html.parser import HTMLParser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -65,11 +66,24 @@ def _get_env(name: str, default: str = "") -> str:
 
 
 def build_from_address(email: str, name: str = "") -> str:
-    """Return 'Display Name <email>' or just 'email'."""
+    """Return 'Display Name <email>' or just 'email'.
+
+    Uses formataddr so non-ASCII display names (Bangla, accents, emoji) are
+    RFC 2047-encoded into ASCII-safe words instead of producing a malformed
+    From header that spam filters penalise.
+    """
     display = name.strip()
     if display:
-        return f"{display} <{email}>"
-    return email
+        return formataddr((display, email.strip()))
+    return email.strip()
+
+
+def _message_id_domain(from_addr: str) -> str:
+    """Domain part of the envelope address, for make_msgid()."""
+    addr = parseaddr(from_addr)[1]
+    if "@" in addr:
+        return addr.rsplit("@", 1)[-1] or "localhost"
+    return "localhost"
 
 
 def validate_credentials(gmail_user: str, gmail_password: str) -> list[str]:
@@ -133,6 +147,95 @@ def parse_recipients(filepath: Path) -> list[dict[str, Any]]:
     return out
 
 
+class _HTMLToTextParser(HTMLParser):
+    """Convert HTML to readable plain text.
+
+    - Entities are decoded (convert_charrefs=True): &amp; -> &
+    - <script>/<style> content is dropped entirely
+    - Block tags produce line breaks; <br> produces a line break
+    - <a href> keeps the URL in parentheses after the link text
+    - <img alt> renders as [image: alt]
+    """
+
+    _BLOCK_TAGS = {
+        "p", "div", "section", "article", "header", "footer", "main", "aside",
+        "table", "tr", "ul", "ol", "li", "blockquote", "pre", "form", "fieldset",
+        "h1", "h2", "h3", "h4", "h5", "h6", "hr",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._skip_depth = 0        # inside <script>/<style>
+        self._href = ""             # pending <a href>
+        self._anchor_text: list[str] = []
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in ("script", "style", "head", "title"):
+            self._skip_depth += 1
+            return
+        if tag == "a":
+            self._href = (dict(attrs).get("href") or "").strip()
+            self._anchor_text = []
+        elif tag == "br":
+            self.parts.append("\n")
+        elif tag == "img":
+            alt = (dict(attrs).get("alt") or "").strip()
+            if alt:
+                self.parts.append(f"[image: {alt}]")
+        elif tag in self._BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in ("script", "style", "head", "title"):
+            self._skip_depth = max(0, self._skip_depth - 1)
+            return
+        if tag == "a":
+            text = "".join(self._anchor_text).strip()
+            if text:
+                self.parts.append(text)
+            if self._href and text and self._href != "#" and text != self._href:
+                self.parts.append(f" ({self._href})")
+            self._href = ""
+            self._anchor_text = []
+        elif tag in self._BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth:
+            return
+        if self._href:
+            self._anchor_text.append(data)
+        else:
+            self.parts.append(data)
+
+    def get_text(self) -> str:
+        text = "".join(self.parts)
+        lines = [re.sub(r"[ \t]+", " ", line.strip()) for line in text.splitlines()]
+        return "\n".join(line for line in lines if line)
+
+
+def html_to_text(html_text: str) -> str:
+    """Convert an HTML email body to readable plain text.
+
+    Proper entity decoding and block handling via html.parser -- replaces the
+    old regex tag-strip that left &amp; behind and ragged whitespace.
+    """
+    parser = _HTMLToTextParser()
+    try:
+        parser.feed(html_text)
+        parser.close()
+    except Exception:
+        # Malformed HTML: fall back to a minimal tag strip rather than failing
+        # the whole upload.
+        fallback = re.sub(r"<[^>]+>", " ", html_text)
+        return "\n".join(line.strip() for line in fallback.splitlines() if line.strip())
+    text = parser.get_text()
+    # Collapse runs of 3+ blank lines that nested blocks can produce.
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def parse_content_upload(filepath: Path | str) -> dict[str, Any]:
     """Parse a .txt, .json, or .html content file into subject, plain body, and html body."""
     path = Path(filepath)
@@ -142,11 +245,7 @@ def parse_content_upload(filepath: Path | str) -> dict[str, Any]:
     if ext == ".html":
         title_match = re.search(r"<title[^>]*>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
         subject = title_match.group(1).strip() if title_match else path.stem
-        # Generate readable plain text version
-        body = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL | re.IGNORECASE)
-        body = re.sub(r"<script[^>]*>.*?</script>", "", body, flags=re.DOTALL | re.IGNORECASE)
-        body = re.sub(r"<[^>]+>", " ", body)
-        body = "\n".join(line.strip() for line in body.splitlines() if line.strip())
+        body = html_to_text(text)
         return {
             "subject": subject,
             "body": body,
@@ -741,6 +840,8 @@ def _build_message(
         msg["From"] = from_addr
         msg["To"] = to
         msg["Subject"] = subject
+        msg["Date"] = formatdate(localtime=False, usegmt=True)
+        msg["Message-ID"] = make_msgid(domain=_message_id_domain(from_addr))
         if lu_header:
             msg["List-Unsubscribe"] = lu_header
             msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"

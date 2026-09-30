@@ -19,6 +19,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import hmac
+import math
 import mimetypes
 import os
 import re
@@ -97,53 +98,454 @@ def validate_credentials(gmail_user: str, gmail_password: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# CSV parsing
+# Recipient parsing & cleaning (CSV & Excel)
 # ---------------------------------------------------------------------------
 
-def parse_recipients(filepath: Path) -> list[dict[str, Any]]:
+def _normalized_header(s: str) -> str:
+    """Lowercase and strip separators so 'E-mail_Address' == 'emailaddress'."""
+    return re.sub(r"[\s_\-]+", "", s.strip().lower())
+
+
+_RAW_EMAIL_HEADER_NAMES = {
+    "email", "mail", "emailaddress", "emailid", "mailid",
+    "recipientemail", "useremail", "customeremail", "clientemail",
+    "electronicmail", "contactemail", "primaryemail", "toemail", "to"
+}
+_EMAIL_HEADER_NAMES = {_normalized_header(x) for x in _RAW_EMAIL_HEADER_NAMES}
+
+_OTHER_PERSON_MARKERS = (
+    "referrer", "referral", "referer", "backup", "alternate", "altmail",
+    "manager", "emergency", "parent", "guardian", "replyto", "bounce",
+    "ccmail", "ccemail", "cc", "bcc"
+)
+
+_RAW_NAME_HEADER_NAMES = {
+    "name", "fullname", "full_name", "customer_name", "client_name",
+    "recipient_name", "first_name", "firstname", "display_name", "user_name",
+    "username", "client", "customer", "recipient", "contact"
+}
+_NAME_HEADER_NAMES = {_normalized_header(x) for x in _RAW_NAME_HEADER_NAMES}
+
+
+def clean_and_validate_email(val: Any) -> str | None:
+    """Clean noise, surrounding punctuation, and validate email syntax.
+    
+    Returns clean email string, or None if invalid/noise.
     """
-    Read a CSV and return one dict per unique email.
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+
+    # Strip zero-width spaces, BOM, and non-breaking spaces
+    s = re.sub(r"[\u200b\u200c\u200d\ufeff\u00a0]", "", s).strip()
+
+    # Handle multiple emails separated by , or ; if any
+    if ("," in s or ";" in s) and not (s.startswith("<") and s.endswith(">")):
+        if s.count("@") > 1:
+            for sub in re.split(r"[,;]\s*", s):
+                clean_sub = clean_and_validate_email(sub)
+                if clean_sub:
+                    return clean_sub
+
+    # Strip mailto:
+    if s.lower().startswith("mailto:"):
+        s = s[7:].strip()
+
+    # Strip surrounding quotes or angle brackets
+    s = s.strip("'\"`")
+    if s.startswith("<") and s.endswith(">"):
+        s = s[1:-1].strip()
+
+    # If format is "Name <user@domain.com>", extract user@domain.com
+    if "<" in s and ">" in s:
+        match = re.search(r"<([^>]+)>", s)
+        if match:
+            s = match.group(1).strip()
+
+    # Strip trailing punctuation (dots, commas, semicolons, colons)
+    s = s.rstrip(".,;:")
+
+    if not s or "@" not in s:
+        return None
+
+    parts = s.split("@")
+    if len(parts) != 2:
+        return None
+
+    local, domain = parts[0].strip(), parts[1].strip()
+    if not local or not domain:
+        return None
+
+    # Domain checks: must contain at least one dot, no consecutive dots
+    if "." not in domain or ".." in domain or domain.startswith(".") or domain.endswith("."):
+        return None
+
+    tld = domain.rsplit(".", 1)[-1]
+    if len(tld) < 2 or not tld.isalpha():
+        return None
+
+    EMAIL_RE = re.compile(
+        r"^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$"
+    )
+    if not EMAIL_RE.match(f"{local}@{domain}"):
+        return None
+
+    # Drop header words or common dummy noise values
+    if local.lower() in {"email", "mail", "none", "null", "undefined", "test", "n/a", "no-email", "username"}:
+        return None
+
+    return f"{local.lower()}@{domain.lower()}"
+
+
+def _looks_like_email(candidate: str) -> bool:
+    return clean_and_validate_email(candidate) is not None
+
+
+def _find_email(row: dict[str, str]) -> str | None:
+    """Pick the recipient's email address from a row dict (backwards compatibility)."""
+    for key, value in row.items():
+        if _normalized_header(str(key)) in _EMAIL_HEADER_NAMES:
+            candidate = clean_and_validate_email(value)
+            if candidate:
+                return candidate
+    for key, value in row.items():
+        norm = _normalized_header(str(key))
+        if any(marker in norm for marker in _OTHER_PERSON_MARKERS):
+            continue
+        candidate = clean_and_validate_email(value)
+        if candidate:
+            return candidate
+    return None
+
+
+def _read_csv_raw_rows(filepath: Path) -> list[list[str]]:
+    """Read CSV or text file, handling different encodings, delimiters, and comments."""
+    content = ""
+    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin1"):
+        try:
+            with filepath.open(newline="", encoding=enc) as f:
+                content = f.read()
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+
+    if not content:
+        return []
+
+    lines = [
+        line for line in content.splitlines()
+        if line.strip() and not line.strip().startswith(("#", "//"))
+    ]
+    if not lines:
+        return []
+
+    sample = "\n".join(lines[:20])
+    try:
+        sniffer = csv.Sniffer()
+        dialect = sniffer.sniff(sample, delimiters=",;\t|")
+    except Exception:
+        dialect = csv.excel
+
+    reader = csv.reader(lines, dialect=dialect)
+    raw_rows: list[list[str]] = []
+    for row in reader:
+        r = list(row)
+        while r and (r[-1] is None or str(r[-1]).strip() == ""):
+            r.pop()
+        if r and any(str(c).strip() for c in r if c is not None):
+            raw_rows.append(r)
+    return raw_rows
+
+
+def _read_excel_raw_rows(filepath: Path) -> list[list[Any]]:
+    """Read Excel workbook (.xlsx, .xls, .xlsm, etc.), picking the first non-empty sheet."""
+    ext = filepath.suffix.lower()
+    raw_rows: list[list[Any]] = []
+
+    if ext in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
+            for sheetname in wb.sheetnames:
+                sheet = wb[sheetname]
+                for row in sheet.iter_rows(values_only=True):
+                    r = list(row)
+                    while r and (r[-1] is None or str(r[-1]).strip() == ""):
+                        r.pop()
+                    if r and any(c is not None and str(c).strip() != "" for c in r):
+                        raw_rows.append(r)
+                if raw_rows:
+                    break
+            wb.close()
+            return raw_rows
+        except Exception:
+            pass
+
+    if ext == ".xls" or not raw_rows:
+        try:
+            import xlrd
+            book = xlrd.open_workbook(filepath)
+            for sheet_idx in range(book.nsheets):
+                sheet = book.sheet_by_index(sheet_idx)
+                for r_idx in range(sheet.nrows):
+                    r = sheet.row_values(r_idx)
+                    while r and (r[-1] is None or str(r[-1]).strip() == ""):
+                        r.pop()
+                    if r and any(c is not None and str(c).strip() != "" for c in r):
+                        raw_rows.append(r)
+                if raw_rows:
+                    break
+            return raw_rows
+        except Exception:
+            pass
+
+    # Generic fallback using pandas if available
+    try:
+        import pandas as pd
+        df = pd.read_excel(filepath, header=None)
+        for _, row in df.iterrows():
+            r = [None if pd.isna(c) else c for c in row]
+            while r and (r[-1] is None or str(r[-1]).strip() == ""):
+                r.pop()
+            if r and any(c is not None and str(c).strip() != "" for c in r):
+                raw_rows.append(r)
+    except Exception:
+        pass
+
+    return raw_rows
+
+
+def _read_file_raw_rows(filepath: Path) -> list[list[Any]]:
+    """Dispatch file reading by extension."""
+    ext = filepath.suffix.lower()
+    if ext in {".xlsx", ".xls", ".xlsm", ".xltx", ".xltm"}:
+        return _read_excel_raw_rows(filepath)
+    return _read_csv_raw_rows(filepath)
+
+
+def _read_csv_rows(filepath: Path) -> list[dict[str, str]]:
+    """Backwards-compatible CSV reader returning rows as dicts."""
+    raw_rows = _read_csv_raw_rows(filepath)
+    if not raw_rows:
+        return []
+    # If first row has email, treat as no header
+    if any(_looks_like_email(c) for c in raw_rows[0]):
+        headers = [f"col_{i}" for i in range(len(raw_rows[0]))]
+        data = raw_rows
+    else:
+        headers = [str(c).strip() for c in raw_rows[0]]
+        data = raw_rows[1:]
+    out = []
+    for r in data:
+        row_dict = {}
+        for i, h in enumerate(headers):
+            row_dict[h] = str(r[i]).strip() if i < len(r) and r[i] is not None else ""
+        out.append(row_dict)
+    return out
+
+
+def process_table_records(raw_rows: list[list[Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Process 2D rows into recipients and comprehensive parse statistics.
+    
+    Dynamically detects the email column and name column, extracts extra
+    merge fields, deduplicates valid emails, and drops errors/noise.
+    """
+    clean_rows: list[list[Any]] = []
+    for row in raw_rows:
+        if not row:
+            continue
+        if any(c is not None and str(c).strip() != "" for c in row):
+            clean_rows.append(row)
+
+    if not clean_rows:
+        return [], {
+            "total_rows": 0,
+            "valid_count": 0,
+            "duplicate_count": 0,
+            "invalid_count": 0,
+            "detected_column": None,
+        }
+
+    # Determine header row (if any)
+    header_idx: int | None = None
+    for idx, row in enumerate(clean_rows[:5]):
+        if any(clean_and_validate_email(c) for c in row):
+            if idx == 0:
+                header_idx = None
+            break
+        row_norm = [_normalized_header(str(c)) for c in row if c is not None]
+        if any(h in _EMAIL_HEADER_NAMES or "email" in h or "mail" in h or h in _NAME_HEADER_NAMES for h in row_norm):
+            header_idx = idx
+            break
+
+    if header_idx is not None:
+        raw_headers = clean_rows[header_idx]
+        data_rows = clean_rows[header_idx + 1:]
+    else:
+        max_cols = max(len(r) for r in clean_rows)
+        raw_headers = [f"Column_{i+1}" for i in range(max_cols)]
+        data_rows = clean_rows
+
+    headers = [
+        str(c).strip() if c is not None and str(c).strip() != "" else f"Column_{i+1}"
+        for i, c in enumerate(raw_headers)
+    ]
+    num_cols = len(headers)
+
+    if not data_rows:
+        return [], {
+            "total_rows": 0,
+            "valid_count": 0,
+            "duplicate_count": 0,
+            "invalid_count": 0,
+            "detected_column": None,
+        }
+
+    # Dynamic email column detection
+    best_col_idx: int | None = None
+    best_score = -999999.0
+
+    for col_idx in range(num_cols):
+        col_name = headers[col_idx]
+        norm = _normalized_header(col_name)
+
+        if norm in _EMAIL_HEADER_NAMES or norm == "email":
+            header_score = 90.0
+        elif any(marker in norm for marker in _OTHER_PERSON_MARKERS):
+            header_score = -50.0
+        elif "email" in norm or norm.endswith("mail"):
+            header_score = 45.0
+        else:
+            header_score = 0.0
+
+        valid_emails = 0
+        non_empty = 0
+        for r in data_rows:
+            val = r[col_idx] if col_idx < len(r) else None
+            if val is not None and str(val).strip() != "":
+                non_empty += 1
+                if clean_and_validate_email(val):
+                    valid_emails += 1
+
+        if valid_emails == 0 or non_empty == 0:
+            score = -100.0
+        else:
+            ratio = valid_emails / non_empty
+            score = header_score + (ratio * 100.0) + min(valid_emails, 50.0)
+
+        if score > best_score and valid_emails > 0:
+            best_score = score
+            best_col_idx = col_idx
+
+    if best_col_idx is None:
+        return [], {
+            "total_rows": len(data_rows),
+            "valid_count": 0,
+            "duplicate_count": 0,
+            "invalid_count": len(data_rows),
+            "detected_column": None,
+        }
+
+    detected_col_name = headers[best_col_idx]
+
+    # Name column detection
+    name_col_idx: int | None = None
+    for col_idx in range(num_cols):
+        if col_idx == best_col_idx:
+            continue
+        norm = _normalized_header(headers[col_idx])
+        if norm in _NAME_HEADER_NAMES or "fullname" in norm or "customername" in norm:
+            name_col_idx = col_idx
+            break
+
+    # Extract recipients, drop noise/invalid/duplicates
+    recipients: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    duplicate_count = 0
+    invalid_count = 0
+
+    for r in data_rows:
+        val = r[best_col_idx] if best_col_idx < len(r) else None
+        cleaned_email = clean_and_validate_email(val)
+        if not cleaned_email:
+            invalid_count += 1
+            continue
+
+        dedup_key = cleaned_email.lower()
+        if dedup_key in seen:
+            duplicate_count += 1
+            continue
+        seen.add(dedup_key)
+
+        # Name extraction
+        name = ""
+        if name_col_idx is not None and name_col_idx < len(r):
+            nval = r[name_col_idx]
+            if nval is not None:
+                name = str(nval).strip()
+
+        # If name is empty, check if email cell had Display Name <email>
+        if not name and val is not None and "<" in str(val) and ">" in str(val):
+            m = re.match(r"^([^<]+)<", str(val).strip())
+            if m:
+                name = m.group(1).strip().strip("'\"`")
+
+        # Extra columns for merge fields
+        extra: dict[str, str] = {}
+        for c_idx in range(len(headers)):
+            if c_idx == best_col_idx or c_idx == name_col_idx:
+                continue
+            col_key = headers[c_idx]
+            cval = r[c_idx] if c_idx < len(r) else None
+            if cval is None:
+                str_val = ""
+            elif isinstance(cval, float):
+                if math.isnan(cval):
+                    str_val = ""
+                elif cval.is_integer():
+                    str_val = str(int(cval))
+                else:
+                    str_val = str(cval)
+            else:
+                str_val = str(cval).strip()
+            extra[col_key] = str_val
+
+        recipients.append({"email": cleaned_email, "name": name, "extra": extra})
+
+    stats = {
+        "total_rows": len(data_rows),
+        "valid_count": len(recipients),
+        "duplicate_count": duplicate_count,
+        "invalid_count": invalid_count,
+        "detected_column": detected_col_name,
+    }
+    return recipients, stats
+
+
+def parse_recipients_with_stats(filepath: Path | str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Parse recipients from CSV or Excel file and return (recipients, stats)."""
+    p = Path(filepath)
+    if not p.exists():
+        return [], {
+            "total_rows": 0,
+            "valid_count": 0,
+            "duplicate_count": 0,
+            "invalid_count": 0,
+            "detected_column": None,
+        }
+    raw_rows = _read_file_raw_rows(p)
+    return process_table_records(raw_rows)
+
+
+def parse_recipients(filepath: Path | str) -> list[dict[str, Any]]:
+    """Read a CSV or Excel file and return one dict per unique email.
+    
     Each dict: { "email": str, "name": str, "extra": {col: val, ...} }
     """
-    if not filepath.exists():
-        return []
-    rows = _read_csv_rows(filepath)
-    if not rows:
-        return []
-
-    columns = list(rows[0].keys()) if rows else []
-    name_keys = {
-        k for k in columns
-        if k and k.strip().lower() in {"name", "fullname", "full_name", "customer_name"}
-    }
-    # The chosen email column is exposed as the top-level "email" field;
-    # keep it out of `extra` so it does not double as a merge column.
-    email_keys = {
-        k for k in columns
-        if k and _normalized_header(str(k)) in _EMAIL_HEADER_NAMES
-    }
-
-    out: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for row in rows:
-        email = _find_email(row)
-        if not email:
-            continue
-        key = email.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        name = ""
-        for k in name_keys:
-            name = str(row.get(k, "")).strip()
-            if name:
-                break
-        extra = {
-            k: v for k, v in row.items()
-            if k and k not in name_keys and k not in email_keys
-        }
-        out.append({"email": email, "name": name, "extra": extra})
-    return out
+    recipients, _ = parse_recipients_with_stats(filepath)
+    return recipients
 
 
 class _HTMLToTextParser(HTMLParser):
@@ -270,91 +672,6 @@ def parse_content_upload(filepath: Path | str) -> dict[str, Any]:
             "html_body": None,
             "source": path.name,
         }
-
-
-def _read_csv_rows(filepath: Path) -> list[dict[str, str]]:
-    with filepath.open(newline="", encoding="utf-8", errors="replace") as f:
-        sample = f.read(8192)
-        f.seek(0)
-        try:
-            sniffer = csv.Sniffer()
-            # Restricted delimiters: on small samples the sniffer can otherwise
-            # guess odd separators (colons, spaces) and shred the rows.
-            dialect = sniffer.sniff(sample, delimiters=",;\t")
-        except Exception:
-            dialect = csv.excel
-
-        # Header detection: csv.Sniffer.has_header() is unreliable on small
-        # recipient lists ("email,name" vs "a@x.com,A" both score 1.0), which
-        # used to drop real column names and replace them with col_0, col_1...
-        # The type-based check is decisive for our use case: a header row's
-        # cells are column NAMES, so no cell in it can look like an address.
-        first_line = sample.splitlines()[0] if sample else ""
-        try:
-            header_cells = next(csv.reader([first_line], dialect=dialect))
-            has_header = not any(_looks_like_email(str(c)) for c in header_cells)
-        except (StopIteration, csv.Error):
-            has_header = True
-
-        reader = csv.DictReader(f, dialect=dialect)
-        if not has_header:
-            first = next(reader, None)            if first is not None:
-                synthetic = [f"col_{i}" for i in range(len(first))]
-                f.seek(0)
-                reader = csv.DictReader(f, fieldnames=synthetic)
-        return list(reader)
-
-
-def _normalized_header(s: str) -> str:
-    """Lowercase and strip separators so 'E-mail_Address' == 'emailaddress'."""
-    return re.sub(r"[\s_\-]+", "", s.strip().lower())
-
-
-# Headers that explicitly name the recipient's own email address.
-_EMAIL_HEADER_NAMES = {"email", "mail", "emailaddress"}
-
-# Column names that hold SOMEONE ELSE'S address (referrer, backup, ...) --
-# never auto-selected, because sending there would mail the wrong person.
-_OTHER_PERSON_MARKERS = (
-    "referrer", "referral", "referer", "backup", "alternate", "altmail",
-    "manager", "emergency", "parent", "guardian", "replyto", "bounce",
-    "ccmail", "ccemail",
-)
-
-
-def _find_email(row: dict[str, str]) -> str | None:
-    """Pick the recipient's email address from a CSV row.
-
-    1. Prefer a column explicitly named for the recipient's address
-       (email, e-mail, mail, email_address...). This stops a
-       referrer_email column earlier in the row from winning.
-    2. Fall back to the first email-looking value in a column that is
-       not flagged as someone else's address (referrer_email,
-       backup_email, reply_to...). A generic address-ish column such as
-       contact_email still qualifies; if ONLY other-person columns
-       hold addresses, return None rather than guess.
-    """
-    for key, value in row.items():
-        if _normalized_header(str(key)) in _EMAIL_HEADER_NAMES:
-            candidate = str(value).strip()
-            if _looks_like_email(candidate):
-                return candidate
-    for key, value in row.items():
-        norm = _normalized_header(str(key))
-        if any(marker in norm for marker in _OTHER_PERSON_MARKERS):
-            continue
-        candidate = str(value).strip()
-        if _looks_like_email(candidate):
-            return candidate
-    return None
-
-
-def _looks_like_email(candidate: str) -> bool:
-    c = candidate.strip().lower()
-    if not c or "@" not in c:
-        return False
-    local, _, domain = c.partition("@")
-    return bool(local and domain and "." in domain)
 
 
 # ---------------------------------------------------------------------------
@@ -974,12 +1291,16 @@ def send_campaign(
     # One connection per send: idle SMTP sessions are routinely dropped after a
     # few minutes, which would otherwise fail every remaining recipient.
     def _connect() -> smtplib.SMTP:
-        s = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
-        try:
+        is_ssl = (SMTP_PORT == 465) or os.getenv("SMTP_USE_SSL", "").strip().lower() in ("true", "1", "yes")
+        if is_ssl:
+            s = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30)
+        else:
+            s = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
             s.ehlo()
             if SMTP_USE_TLS:
                 s.starttls()
                 s.ehlo()
+        try:
             s.login(gmail_user, gmail_password)
             return s
         except BaseException:

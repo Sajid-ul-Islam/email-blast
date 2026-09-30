@@ -4,9 +4,9 @@ A small Flask web app to upload CSV recipient lists, compose or upload email con
 
 ## Features
 
-- **CSV upload** — drag-and-drop or file-picker; detects emails in any column, deduplicates, and previews up to 20 rows
+- **CSV & Excel upload** — supports both CSV (`.csv`, `.txt`) and Excel (`.xlsx`, `.xls`) files; dynamically detects the email column regardless of column name or placement; automatically cleans noise, removes malformed emails, and deduplicates; previews up to 20 rows with summary metrics
 - **Content upload** — upload `.txt`, `.json`, or `.html` files to auto-fill subject and body
-- **Merge fields** — use `{{name}}`, `{{city}}`, or any CSV column in the body for personalisation
+- **Merge fields** — use `{{name}}`, `{{city}}`, or any column from your recipient list for personalisation
 - **HTML email** — send `multipart/alternative` (plain + HTML) when an HTML body is provided
 - **Live progress** — `/job/<id>` page with auto-refreshing stats, progress bar, and per-recipient result rows; polling uses the `/job/<id>/status` JSON endpoint
 - **Pacing & rate limiting** — three modes: `auto` (45–120 s based on list size), `fixed`, or `per_hour`; adaptive backoff on transient errors; daily cap (default 100)

@@ -25,7 +25,7 @@ from flask import (
 )
 from werkzeug.utils import secure_filename
 from sender import (
-    parse_recipients, parse_content_upload,
+    parse_recipients, parse_recipients_with_stats, parse_content_upload,
     send_campaign, unknown_merge_fields,
     append_to_suppression, build_unsubscribe_url, load_suppressed_emails,
     verify_unsubscribe_token,
@@ -140,7 +140,7 @@ def _one_click_url(email: str) -> str:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-ALLOWED_LIST_EXTS = {".csv", ".txt"}
+ALLOWED_LIST_EXTS = {".csv", ".xlsx", ".xls", ".xlsm", ".xltx", ".txt"}
 ALLOWED_CONTENT_EXTS = {".txt", ".json", ".html"}
 ALLOWED_ATTACH_EXTS = {
     ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
@@ -405,24 +405,26 @@ def index():
     row_count = 0
     email_count = 0
     duplicates = 0
+    invalid_count = 0
+    detected_column = ""
     email_list = []
     preview_limit = 20
     preview_names = False
 
     if file_id:
         filepath = safe_child(UPLOADS_DIR, file_id)
-        if filepath is not None:
+        if filepath is not None and filepath.exists():
             uploaded = True
             filename = filepath.name
             try:
-                recipients = parse_recipients(filepath)
+                recipients, stats = parse_recipients_with_stats(filepath)
                 email_count = len(recipients)
+                row_count = stats.get("total_rows", 0)
+                duplicates = stats.get("duplicate_count", 0)
+                invalid_count = stats.get("invalid_count", 0)
+                detected_column = stats.get("detected_column") or ""
                 preview_names = any(bool(r.get("name")) for r in recipients)
                 email_list = recipients[:preview_limit]
-                # Rough row count
-                with filepath.open("r", encoding="utf-8", errors="replace") as f:
-                    row_count = max(0, sum(1 for line in f if line.strip()) - 1)
-                duplicates = max(0, row_count - email_count)
             except Exception as e:
                 log.error("Failed to parse %s: %s", filepath, e)
 
@@ -436,6 +438,8 @@ def index():
         row_count=row_count,
         email_count=email_count,
         duplicates=duplicates,
+        invalid_count=invalid_count,
+        detected_column=detected_column,
         email_list=email_list,
         preview_limit=preview_limit,
         preview_names=preview_names,
@@ -452,7 +456,7 @@ def upload_file():
 
     ext = Path(file.filename).suffix.lower()
     if ext not in ALLOWED_LIST_EXTS:
-        flash("Invalid file extension. Please upload a .csv file.")
+        flash("Invalid file extension. Please upload a CSV (.csv) or Excel (.xlsx, .xls) file.")
         return redirect(url_for("index"))
 
     safe_name = f"{uuid.uuid4().hex[:8]}_{secure_filename(file.filename) or f'file{ext}'}"

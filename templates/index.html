@@ -17,21 +17,29 @@
       </div>
       {% endif %}
       <h1>📧 Email Blast</h1>
-      <p class="subtitle">Upload a CSV of recipients, write or upload the content, then send.</p>
+      <p class="subtitle">Upload a CSV or Excel file of recipients, write or upload the content, then send.</p>
     </header>
+
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        {% for message in messages %}
+          <div class="error-box">{{ message }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
 
     <section class="card upload-card">
       <h2>1. Upload your recipient list</h2>
-      <p class="hint">CSV with at least one column containing email addresses. 
-         See the <a href="/sample.csv">sample CSV</a> for the recommended format.</p>
+      <p class="hint">CSV or Excel spreadsheet (<code>.csv</code>, <code>.xlsx</code>, <code>.xls</code>). The app dynamically detects the email column.
+         See the <a href="/sample.csv">sample CSV</a> for reference.</p>
 
       <form action="/upload" method="post" enctype="multipart/form-data" class="upload-form">
         <div class="file-zone" id="fileZone">
-          <input type="file" name="file" id="fileInput" accept=".csv" required>
+          <input type="file" name="file" id="fileInput" accept=".csv,.xlsx,.xls,.xlsm,.xltx,.txt" required>
           <label for="fileInput" class="file-label" id="fileLabel">
             <span class="file-icon">📄</span>
             <span class="file-text">
-              <strong class="file-click">Click to choose a CSV file</strong>
+              <strong class="file-click">Click to choose a CSV or Excel file</strong>
               <span class="file-or">or drag it here</span>
             </span>
           </label>
@@ -41,12 +49,12 @@
       </form>
 
       <div class="requirements">
-        <h3>CSV format</h3>
+        <h3>File format &amp; detection</h3>
         <ul>
-          <li><strong>Required:</strong> at least one column with email addresses (anything containing <code>@</code>).</li>
-          <li><strong>Optional:</strong> a <code>name</code> column for personalization, plus any extra columns you like (city, phone, etc.).</li>
-          <li>One recipient per row. The app extracts every valid email it finds.</li>
-          <li>Duplicate emails are deduplicated automatically.</li>
+          <li><strong>Supported formats:</strong> CSV (<code>.csv</code>, <code>.txt</code>) and Excel (<code>.xlsx</code>, <code>.xls</code>).</li>
+          <li><strong>Dynamic detection:</strong> The email column is detected automatically—no specific column name or position required.</li>
+          <li><strong>Personalization:</strong> Optional <code>name</code> column for {% raw %}<code>{{name}}</code>{% endraw %}, plus any extra columns for custom merge fields (e.g. {% raw %}<code>{{city}}</code>, <code>{{phone}}</code>{% endraw %}).</li>
+          <li><strong>Automatic list hygiene:</strong> Duplicate emails, invalid formats, empty rows, and surrounding noise are dropped automatically.</li>
         </ul>
       </div>
     </section>
@@ -59,6 +67,12 @@
         <span><strong>Rows found:</strong> {{ row_count }}</span>
         <span><strong>Valid emails:</strong> {{ email_count }}</span>
         <span><strong>Duplicates removed:</strong> {{ duplicates }}</span>
+        {% if invalid_count %}
+        <span><strong>Invalid / noise dropped:</strong> {{ invalid_count }}</span>
+        {% endif %}
+        {% if detected_column %}
+        <span><strong>Email column:</strong> {{ detected_column }}</span>
+        {% endif %}
       </div>
 
       {% if email_list %}
@@ -117,7 +131,7 @@
 
         <div class="field">
           <label for="body">Body</label>
-          <textarea id="body" name="body" class="textarea" rows="8" placeholder="Write your message here. Use {{name}} to insert the recipient's name, {{city}}, {{phone}}, etc. for other CSV columns."></textarea>
+          <textarea id="body" name="body" class="textarea" rows="8" placeholder="Write your message here. Use {{name}} to insert the recipient's name, {{city}}, {{phone}}, etc. for other list columns."></textarea>
         </div>
 
         <div class="field">
@@ -207,7 +221,7 @@
           };
         } else {
           fileLabel.querySelector('.file-text').innerHTML =
-            '<strong class="file-click">Click to choose a CSV file</strong>' +
+            '<strong class="file-click">Click to choose a CSV or Excel file</strong>' +
             '<span class="file-or">or drag it here</span>';
         }
       }
